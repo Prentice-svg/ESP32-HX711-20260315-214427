@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio run:*)",
+      "Bash(~/.platformio/penv/bin/pio:*)",
+      "Bash(stty:*)",
+      "Bash(timeout:*)",
+      "Bash(platformio run:*)",
+      "mcp__web-reader__webReader",
+      "Bash(node:*)",
+      "Bash(npm --version:*)",
+      "Bash(npm install:*)",
+      "Bash(happy:*)"
+    ]
+  }
+}

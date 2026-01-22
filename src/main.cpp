@@ -1,567 +1,1399 @@
 /**
- * ESP32-C3 SuperMini UPS Simulator
- * Megatec Q1 Protocol Emulation for Linux NUT / 飞牛NAS
+ * ESP32-WROOM-32E 步进电机调速仪 + Phyphox 力学实验
+ * Stepper Motor Speed Controller with S-Curve Acceleration
  * 
  * 硬件配置:
- * - MCU: ESP32-C3 SuperMini (使用原生 USB Serial)
- * - 传感器: INA226 (I2C 地址 0x44, 采样电阻 0.025Ω)
- * - 显示: 0.96寸 OLED (SSD1315/SSD1306 I2C)
+ * - MCU: ESP32-WROOM-32E (双核 Xtensa LX6 @ 240MHz)
+ * - 驱动: DRV8825 步进电机驱动模块
+ * - 电机: 17HS3401S (1.8°步距角, 200步/圈)
+ * - 传动: 2GT同步带 20齿惰轮
+ * - 力传感器: HX711 + 称重传感器
  * 
- * 串口波特率: 115200 (USB 虚拟串口)
- * 注: 传统 RS232 UPS 通常使用 2400 波特率
+ * 接线 (ESP32-WROOM-32E):
+ * - STEP  -> GPIO25
+ * - DIR   -> GPIO26
+ * - EN    -> GPIO27
+ * - M0/M1/M2 -> 用跳线帽设置微步 (不由MCU控制)
+ * - BTN_UP    -> GPIO32
+ * - BTN_DOWN  -> GPIO33
+ * - BTN_ENTER -> GPIO18
+ * - BTN_BACK  -> GPIO19
+ * - SDA   -> GPIO21
+ * - SCL   -> GPIO22
+ * - HX711_DOUT -> GPIO16
+ * - HX711_SCK  -> GPIO17
  * 
- * NUT 配置示例 (/etc/nut/ups.conf):
- * [myups]
- *     driver = blazer_ser
- *     port = /dev/ttyACM0
- *     desc = "ESP32-C3 Simulated UPS"
- * 
- * 作者: GitHub Copilot
- * 日期: 2026-01-05
+ * 注意: M0/M1/M2 不再由 MCU 控制，请用跳线帽设置:
+ *   全步: M0=L, M1=L, M2=L (或全部悬空)
+ *   1/16: M0=L, M1=L, M2=H
  */
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <INA226.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include "chinese_font.h"
+#include <HX711.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Preferences.h>  // NVS存储
 
-// ==================== 硬件配置 ====================
+// 禁用掉电检测器 (解决 USB 供电不足导致的重启问题)
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
-// I2C 引脚定义 (ESP32-C3 SuperMini)
-// 注意: GPIO8 是板载 LED，不能用作 I2C！
-#define I2C_SDA_PIN         4
-#define I2C_SCL_PIN         5
+// NVS存储对象
+Preferences preferences;
 
-// INA226 配置
-#define INA226_ADDRESS      0x44
-#define SHUNT_RESISTOR      0.025   // 采样电阻 25mΩ
-#define MAX_CURRENT         5.0     // 最大电流 5A
+// ==================== 引脚配置 ====================
 
-// 校准系数 (根据实际测量调整)
-// 计算方法: 实际电压 / 显示电压 = 12.56 / 13.30 ≈ 0.944
-#define VOLTAGE_CALIBRATION 0.944   // 电压校准系数
-#define CURRENT_CALIBRATION 1.0     // 电流校准系数 (如需要可调整)
+// DRV8825 控制引脚 (只用3个)
+#define PIN_STEP            25
+#define PIN_DIR             26
+#define PIN_ENABLE          27
 
-// OLED 配置
+// 按键 (低电平有效)
+#define PIN_BTN_UP          32
+#define PIN_BTN_DOWN        33
+#define PIN_BTN_ENTER       18
+#define PIN_BTN_BACK        19
+
+// I2C (OLED)
+#define I2C_SDA_PIN         21
+#define I2C_SCL_PIN         22
+
+// HX711 力传感器
+#define HX711_DOUT_PIN      16
+#define HX711_SCK_PIN       17
+
+// ==================== OLED 配置 ====================
+
 #define SCREEN_WIDTH        128
 #define SCREEN_HEIGHT       64
-#define OLED_RESET          -1      // 无复位引脚
-#define OLED_ADDRESS        0x3C    // SSD1315/SSD1306 默认地址
+#define OLED_ADDRESS        0x3C
 
-// UPS 模拟参数
-#define SIMULATED_MAX_POWER 15.0    // 模拟 UPS 最大功率 (W)
-#define AC_ONLINE_THRESHOLD 11.8    // 市电在线电压阈值 (V)
-#define LOW_BATTERY_THRESHOLD 10.8  // 低电量阈值 (V)
-#define MAINS_OK_THRESHOLD  11.0    // 市电正常阈值 (V)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// 串口配置
-#define SERIAL_BAUD_RATE    115200
-#define SERIAL_TIMEOUT_MS   100
+// ==================== HX711 力传感器 ====================
 
-// ==================== 全局对象 ====================
+HX711 scale;
+float forceReading = 0;           // 当前力读数 (N)
+float forceCalibration = 420.0;   // 校准系数 (根据传感器调整)
+float forceTare = 0;              // 零点偏移
+bool hx711Ready = false;
 
-INA226 ina226(INA226_ADDRESS);
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// 校准参数
+const float CALIBRATION_MASS = 100.0;   // 校准砝码质量 (g)
+const float GRAVITY = 9.80665;          // 重力加速度 (m/s²)
+const float G_TO_N = GRAVITY / 1000.0;  // g 转 N 系数 (0.00980665)
+bool calibrationMode = false;           // 校准模式标志
+int calibrationStep = 0;                // 校准步骤: 0=等待空载, 1=等待放砝码, 2=完成
+long calibrationZeroRaw = 0;            // 校准时的零点ADC原始值
+long calibrationLoadRaw = 0;            // 校准时放砝码的ADC原始值
 
-// ==================== 状态变量 ====================
+// 力传感器滤波参数 - 卡尔曼滤波
+float kalmanEstimate = 0;         // 卡尔曼估计值
+float kalmanErrorEst = 1.0;       // 估计误差协方差
+const float KALMAN_Q = 0.01;      // 过程噪声协方差 (越小越平滑，但响应慢)
+const float KALMAN_R = 0.1;       // 测量噪声协方差 (越大越平滑，但响应慢)
+bool kalmanInitialized = false;   // 卡尔曼滤波器是否已初始化
 
-// INA226 读数
-float busVoltage = 0.0;       // 总线电压 (V)
-float shuntCurrent = 0.0;     // 电流 (A)
-float power = 0.0;            // 功率 (W)
+// ==================== BLE Phyphox ====================
 
-// 滤波缓冲区
-#define FILTER_SIZE 8
-float voltageBuffer[FILTER_SIZE] = {0};
-float currentBuffer[FILTER_SIZE] = {0};
-float powerBuffer[FILTER_SIZE] = {0};
-int filterIndex = 0;
-bool filterFilled = false;
+#define SERVICE_UUID        "cddf1001-30f7-4671-8b43-5e40ba53514a"
+#define CHAR_SPEED_UUID     "cddf1002-30f7-4671-8b43-5e40ba53514a"
+#define CHAR_FORCE_UUID     "cddf1003-30f7-4671-8b43-5e40ba53514a"
+#define CHAR_DISTANCE_UUID  "cddf1004-30f7-4671-8b43-5e40ba53514a"
+#define CHAR_TIME_UUID      "cddf1005-30f7-4671-8b43-5e40ba53514a"
 
-// UPS 模拟状态
-bool onBattery = false;       // true = 电池供电, false = 市电在线
-bool lowBattery = false;      // true = 电量低
-bool inaConnected = false;    // INA226 连接状态
+BLEServer *pServer = NULL;
+BLECharacteristic *pSpeedChar = NULL;
+BLECharacteristic *pForceChar = NULL;
+BLECharacteristic *pDistanceChar = NULL;
+BLECharacteristic *pTimeChar = NULL;
+bool bleConnected = false;
+bool phyphoxMode = false;         // Phyphox 实验模式
+uint32_t bleStartTime = 0;
 
-// 串口缓冲区
-String serialBuffer = "";
-unsigned long lastUpdateTime = 0;
-const unsigned long UPDATE_INTERVAL = 500; // 更新间隔 (ms)
+// ==================== 电机参数 ====================
+
+// 微步设置 - 根据 DRV8825 跳线帽实际设置修改此值
+// 全步=1, 半步=2, 1/4=4, 1/8=8, 1/16=16, 1/32=32
+// 
+// 当前接法: M0=VCC, M1=悬空(GND), M2=VCC → 1/32 微步 (最平滑)
+#define MICROSTEP_DIV       32      // 当前: 1/32 微步
+
+#define STEPS_PER_REV       200
+#define PULLEY_TEETH        20
+#define BELT_PITCH          2.0     // mm
+
+const float STEPS_PER_MM = (float)(STEPS_PER_REV * MICROSTEP_DIV) / (PULLEY_TEETH * BELT_PITCH);
+const float MM_PER_STEP = 1.0 / STEPS_PER_MM;
+
+// ==================== 运动参数 ====================
+
+float targetSpeed = 50.0;           // mm/s
+float targetDistance = 100.0;       // mm
+uint32_t targetTime = 10;           // 秒
+uint32_t accelTime = 800;           // ms (延长加速时间使启动更平滑)
+bool direction = true;              // true=正向
+
+// 平滑度参数
+const float MIN_START_SPEED = 12.0;  // mm/s 最小起步速度,避免低速抖动区间
+
+// ==================== 共振补偿参数 ====================
+// 步进电机在特定频率会共振，通常在 50-200 Hz 和 500-1500 Hz
+// 共振频率 = 速度(mm/s) * STEPS_PER_MM
+// 对于 1/32 微步: STEPS_PER_MM = 80, 所以:
+//   100 Hz 共振 ≈ 1.25 mm/s
+//   800 Hz 共振 ≈ 10 mm/s
+//   1200 Hz 共振 ≈ 15 mm/s
+
+// 共振区间 (mm/s) - 根据实际观察调整
+const float RESONANCE_ZONE1_LOW = 8.0;    // 第一共振区下限
+const float RESONANCE_ZONE1_HIGH = 18.0;  // 第一共振区上限
+const float RESONANCE_ZONE2_LOW = 35.0;   // 第二共振区下限
+const float RESONANCE_ZONE2_HIGH = 50.0;  // 第二共振区上限
+
+// 共振区平滑过渡参数
+const float RESONANCE_TRANSITION_WIDTH = 3.0;  // 过渡区宽度（mm/s）
+
+// 补偿强度
+const uint32_t DITHER_AMOUNT = 8;         // 脉冲抖动量 (微秒) - 减小抖动提高平滑度
+const float RESONANCE_ACCEL_BOOST = 1.3;  // 共振区加速倍率 - 温和通过
+
+enum MotionMode { MODE_CONTINUOUS, MODE_DISTANCE, MODE_RECIPROCATE, MODE_RESONANCE_SCAN };
+MotionMode motionMode = MODE_CONTINUOUS;
+
+// ==================== 菜单系统 ====================
+
+enum MenuState { MENU_MAIN, MENU_RUNNING, MENU_COMPLETED, MENU_CALIBRATE };
+MenuState currentMenu = MENU_MAIN;
+int menuIndex = 0;
+const int MENU_ITEMS = 12;  // 增加校准选项
+int menuScrollOffset = 0;   // 菜单滚动偏移
+const int VISIBLE_ITEMS = 7;  // 屏幕可见菜单项数
+
+const char* menuLabels[] = {
+    "Speed",
+    "Distance",
+    "Time",
+    "Accel",
+    "Direction",
+    "Mode",
+    "ResoScan",   // 共振扫描
+    "Phyphox",    // Phyphox 实验模式
+    "Tare",       // 力传感器归零
+    "Calibrate", // 力传感器校准 (100g砝码)
+    "Unlock",     // 解锁电机
+    "START"
+};
+
+// ==================== 运行状态 ====================
+
+volatile bool isRunning = false;
+volatile bool isPaused = false;
+volatile uint32_t stepCounter = 0;
+volatile float currentSpeed = 0;
+volatile uint32_t stepInterval = 100000;  // 当前步进间隔(微秒)
+volatile bool isInAcceleration = false;   // 标记是否在加速/减速阶段（用于控制抖动）
+uint32_t runStartTime = 0;
+int reciprocateCount = 0;
+bool motorLocked = false;  // 电机锁定状态
+
+// 硬件定时器
+hw_timer_t *stepTimer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t ditherSeed = 12345;  // 简单随机数种子
+
+// 共振扫描参数
+bool resonanceScanMode = false;
+float scanSpeed = 5.0;              // 当前扫描速度
+const float SCAN_MIN_SPEED = 5.0;   // 扫描起始速度
+const float SCAN_MAX_SPEED = 150.0; // 扫描结束速度
+const float SCAN_STEP = 0.5;        // 每次速度增量
+const uint32_t SCAN_HOLD_MS = 200;  // 每个速度保持时间
+uint32_t lastScanStepTime = 0;
+
+// 按键
+unsigned long lastButtonTime = 0;
+unsigned long lastDisplayTime = 0;
+const unsigned long DISPLAY_INTERVAL = 100;  // OLED更新间隔100ms
+unsigned long lastBLETime = 0;
+const unsigned long BLE_INTERVAL = 50;       // BLE数据发送间隔50ms (20Hz)
+
+// ==================== BLE 回调 ====================
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        bleConnected = true;
+        Serial.println("BLE: Phyphox connected!");
+    }
+    void onDisconnect(BLEServer* pServer) {
+        bleConnected = false;
+        Serial.println("BLE: Phyphox disconnected");
+        // 重新开始广播
+        pServer->startAdvertising();
+    }
+};
 
 // ==================== 函数声明 ====================
 
-void initINA226();
+void IRAM_ATTR onStepTimer();
+void initPins();
+void initTimer();
 void initOLED();
-void readSensors();
-void updateUPSStatus();
-void processSerialCommand(String cmd);
-void sendQ1Response();
-void sendInfoResponse();
-void sendRatingResponse();
+void initHX711();
+void initBLE();
+void enableMotor(bool en);
+void setDirection(bool dir);
+void processButtons();
+void runMotorStep();
+void startMotion();
+void stopMotion();
+void startResonanceScan();
+void updateResonanceScan();
+void startPhyphoxMode();
+void stopPhyphoxMode();
+void updatePhyphox();
+void sendBLEData();
+void readForce();
+void tareForce();
+void saveCalibration();
+bool loadCalibration();
+void startCalibration();
+void doCalibrationStep();
+void cancelCalibration();
+void drawCalibrationScreen();
 void updateDisplay();
-String formatFloat(float value, int width, int decimals);
-void drawChineseChar(int x, int y, const uint8_t charData[3][12]);
+void drawMainMenu();
+void drawRunningScreen();
+void drawScanScreen();
+void drawPhyphoxScreen();
+void drawCompletedScreen();
+float sCurveSpeed(uint32_t elapsedMs, uint32_t accelMs, uint32_t totalMs, float maxSpeed);
+uint32_t speedToInterval(float speed);
+void updateMotionParams();
 
 // ==================== 初始化 ====================
 
 void setup() {
-    // 初始化串口 (USB CDC)
-    Serial.begin(SERIAL_BAUD_RATE);
-    Serial.setTimeout(SERIAL_TIMEOUT_MS);
+    // 禁用掉电检测器 (防止 USB 供电不稳定时重启)
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
     
-    // 等待串口就绪 (USB CDC 需要)
+    Serial.begin(115200);
     delay(1000);
     
-    // 初始化 I2C
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.setClock(400000); // 400kHz Fast Mode
+    Serial.println("========================================");
+    Serial.println("  ESP32 Stepper + Phyphox Force Lab");
+    Serial.println("========================================");
     
-    // 初始化外设
+    initPins();
+    initTimer();
     initOLED();
-    initINA226();
+    initHX711();
+    initBLE();
     
-    // 初始显示
+    enableMotor(false);
+    
+    Serial.println("Ready!");
+    Serial.print("MM_PER_STEP = "); Serial.println(MM_PER_STEP, 6);
+    Serial.print("Microstep = 1/"); Serial.println(MICROSTEP_DIV);
+    
+    // 初始化完成后立即显示主菜单
+    delay(500);
+    lastDisplayTime = 0;  // 强制立即更新显示
     updateDisplay();
+    Serial.println("Menu displayed!");
 }
 
-// ==================== 主循环 ====================
-
 void loop() {
-    // 处理串口数据
-    while (Serial.available() > 0) {
-        char c = Serial.read();
-        
-        if (c == '\r' || c == '\n') {
-            // 收到命令结束符
-            if (serialBuffer.length() > 0) {
-                processSerialCommand(serialBuffer);
-                serialBuffer = "";
-            }
-        } else {
-            // 累积字符
-            serialBuffer += c;
-            
-            // 防止缓冲区溢出
-            if (serialBuffer.length() > 32) {
-                serialBuffer = "";
-            }
-        }
+    processButtons();
+    
+    // 读取力传感器
+    readForce();
+    
+    // Phyphox 实验模式
+    if (phyphoxMode) {
+        updatePhyphox();
+    }
+    // 共振扫描模式
+    else if (resonanceScanMode) {
+        updateResonanceScan();
+    }
+    // 普通运行模式
+    else if (isRunning && !isPaused) {
+        updateMotionParams();
     }
     
-    // 定时更新传感器和显示
-    unsigned long currentTime = millis();
-    if (currentTime - lastUpdateTime >= UPDATE_INTERVAL) {
-        lastUpdateTime = currentTime;
-        
-        readSensors();
-        updateUPSStatus();
+    // 限制OLED更新频率，避免干扰
+    if (millis() - lastDisplayTime >= DISPLAY_INTERVAL) {
+        lastDisplayTime = millis();
         updateDisplay();
     }
 }
 
-// ==================== INA226 初始化 ====================
+// ==================== 引脚初始化 ====================
 
-void initINA226() {
-    if (ina226.begin()) {
-        inaConnected = true;
+void initPins() {
+    pinMode(PIN_STEP, OUTPUT);
+    pinMode(PIN_DIR, OUTPUT);
+    pinMode(PIN_ENABLE, OUTPUT);
+    
+    digitalWrite(PIN_STEP, LOW);
+    digitalWrite(PIN_DIR, HIGH);
+    digitalWrite(PIN_ENABLE, HIGH);  // 禁用
+    
+    pinMode(PIN_BTN_UP, INPUT_PULLUP);
+    pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
+    pinMode(PIN_BTN_ENTER, INPUT_PULLUP);
+    pinMode(PIN_BTN_BACK, INPUT_PULLUP);
+    
+    Serial.println("Pins initialized (M0/M1/M2 not controlled)");
+    Serial.print("  STEP=GPIO"); Serial.println(PIN_STEP);
+    Serial.print("  DIR=GPIO"); Serial.println(PIN_DIR);
+    Serial.print("  EN=GPIO"); Serial.println(PIN_ENABLE);
+}
+
+// ==================== HX711 初始化 ====================
+
+void initHX711() {
+    Serial.println("Initializing HX711...");
+    scale.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+    
+    if (scale.wait_ready_timeout(1000)) {
+        hx711Ready = true;
         
-        // 配置 INA226
-        // 设置采样电阻值 (mΩ)
-        ina226.setMaxCurrentShunt(MAX_CURRENT, SHUNT_RESISTOR);
-        
-        // 配置平均采样次数和转换时间
-        // AVG = 128 (更高的硬件平均), VBUS CT = 2.116ms, VSH CT = 2.116ms
-        ina226.setAverage(128);
-        ina226.setBusVoltageConversionTime(6);  // 2.116ms
-        ina226.setShuntVoltageConversionTime(6); // 2.116ms
-        
-        // 设置为连续测量模式 (mode 7 = Shunt and Bus, Continuous)
-        ina226.setMode(7);
+        // 尝试从NVS加载校准数据
+        if (loadCalibration()) {
+            Serial.println("Using saved calibration data");
+        } else {
+            // 没有保存的校准数据，使用默认值
+            scale.set_scale(forceCalibration);
+            scale.tare();
+            Serial.println("Using default calibration - please calibrate with 100g weight");
+        }
+        Serial.println("HX711 ready!");
     } else {
-        inaConnected = false;
+        hx711Ready = false;
+        Serial.println("HX711 not found - force sensing disabled");
     }
 }
 
-// ==================== OLED 初始化 ====================
+void readForce() {
+    static unsigned long lastForceRead = 0;
+    if (millis() - lastForceRead < 20) return;  // 50Hz 采样率
+    lastForceRead = millis();
 
-void initOLED() {
-    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
-        // OLED 初始化失败，继续运行但不显示
+    if (hx711Ready && scale.is_ready()) {
+        // 读取原始值 (单位: g)
+        float rawReading = scale.get_units(1);
+        
+        // ========== 卡尔曼滤波 ==========
+        // 1. 初始化（首次运行）
+        if (!kalmanInitialized) {
+            kalmanEstimate = rawReading;
+            kalmanErrorEst = 1.0;
+            kalmanInitialized = true;
+        }
+        
+        // 2. 预测步骤 (Predict)
+        // 状态预测: x_pred = x_est (假设力变化缓慢)
+        // 误差协方差预测: P_pred = P_est + Q
+        float errorPred = kalmanErrorEst + KALMAN_Q;
+        
+        // 3. 更新步骤 (Update)
+        // 卡尔曼增益: K = P_pred / (P_pred + R)
+        float kalmanGain = errorPred / (errorPred + KALMAN_R);
+        
+        // 状态更新: x_est = x_pred + K * (measurement - x_pred)
+        kalmanEstimate = kalmanEstimate + kalmanGain * (rawReading - kalmanEstimate);
+        
+        // 误差协方差更新: P_est = (1 - K) * P_pred
+        kalmanErrorEst = (1.0 - kalmanGain) * errorPred;
+        
+        // 应用零点偏移并转换为牛顿 (N)
+        float filteredGrams = kalmanEstimate - forceTare;
+        forceReading = filteredGrams * G_TO_N;
+    }
+}
+
+void tareForce() {
+    if (hx711Ready) {
+        // 读取当前原始值作为零点偏移
+        long rawValue = scale.read_average(10);
+        scale.set_offset(rawValue);
+        forceTare = 0;
+        
+        // 重置卡尔曼滤波器
+        kalmanEstimate = 0;
+        kalmanErrorEst = 1.0;
+        kalmanInitialized = false;
+        
+        Serial.println("Force tared!");
+        Serial.print("New offset: "); Serial.println(rawValue);
+    }
+}
+
+// 保存校准数据到NVS
+void saveCalibration() {
+    preferences.begin("forcecal", false);  // 读写模式
+    preferences.putFloat("calFactor", forceCalibration);
+    preferences.putLong("offset", scale.get_offset());
+    preferences.end();
+    Serial.println("Calibration saved to NVS!");
+    Serial.print("  Factor: "); Serial.println(forceCalibration);
+    Serial.print("  Offset: "); Serial.println(scale.get_offset());
+}
+
+// 从NVS加载校准数据
+bool loadCalibration() {
+    preferences.begin("forcecal", true);  // 只读模式
+    float savedFactor = preferences.getFloat("calFactor", 0);
+    long savedOffset = preferences.getLong("offset", 0);
+    preferences.end();
+    
+    if (savedFactor != 0) {
+        forceCalibration = savedFactor;
+        scale.set_scale(forceCalibration);
+        scale.set_offset(savedOffset);
+        Serial.println("Calibration loaded from NVS!");
+        Serial.print("  Factor: "); Serial.println(forceCalibration);
+        Serial.print("  Offset: "); Serial.println(savedOffset);
+        return true;
+    }
+    return false;
+}
+
+// 开始校准流程
+void startCalibration() {
+    if (!hx711Ready) {
+        Serial.println("HX711 not ready!");
         return;
     }
+    calibrationMode = true;
+    calibrationStep = 0;
+    currentMenu = MENU_CALIBRATE;
+    Serial.println("Calibration started - remove all weight");
+}
+
+// 执行校准步骤
+void doCalibrationStep() {
+    if (!hx711Ready) return;
     
+    if (calibrationStep == 0) {
+        // 步骤1：记录空载原始值 (使用 read_average 获取真正的原始ADC值)
+        calibrationZeroRaw = scale.read_average(20);  // 多次采样取平均
+        calibrationStep = 1;
+        Serial.print("Zero raw (ADC): "); Serial.println(calibrationZeroRaw);
+        Serial.println("Now place 100g weight...");
+    } 
+    else if (calibrationStep == 1) {
+        // 步骤2：记录放砝码后的原始值
+        calibrationLoadRaw = scale.read_average(20);
+        Serial.print("Load raw (ADC): "); Serial.println(calibrationLoadRaw);
+        
+        // 计算校准系数
+        float rawDiff = calibrationLoadRaw - calibrationZeroRaw;
+        Serial.print("Raw diff: "); Serial.println(rawDiff);
+        
+        if (abs(rawDiff) > 1000) {  // 确保有有效的差值
+            // 校准系数 = ADC差值 / 质量(g)
+            forceCalibration = rawDiff / CALIBRATION_MASS;
+            
+            // 应用新的校准系数和零点
+            scale.set_scale(forceCalibration);
+            scale.set_offset((long)calibrationZeroRaw);  // 设置空载时的ADC值为零点
+            
+            // 保存到NVS
+            saveCalibration();
+            
+            calibrationStep = 2;
+            Serial.print("New calibration factor: "); Serial.println(forceCalibration);
+            Serial.println("Calibration complete and saved!");
+        } else {
+            Serial.println("Error: weight not detected (diff too small)");
+            Serial.println("Make sure 100g weight is properly placed");
+            calibrationStep = 0;
+        }
+    }
+    else if (calibrationStep == 2) {
+        // 校准完成，退出
+        calibrationMode = false;
+        currentMenu = MENU_MAIN;
+    }
+}
+
+// 取消校准
+void cancelCalibration() {
+    calibrationMode = false;
+    calibrationStep = 0;
+    // 重新加载之前保存的校准数据
+    loadCalibration();
+    currentMenu = MENU_MAIN;
+    Serial.println("Calibration cancelled");
+}
+
+// ==================== BLE Phyphox 初始化 ====================
+
+void initBLE() {
+    Serial.println("Initializing BLE for Phyphox...");
+    
+    BLEDevice::init("ESP32-Stepper");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    
+    // 创建特征值
+    pSpeedChar = pService->createCharacteristic(
+        CHAR_SPEED_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pSpeedChar->addDescriptor(new BLE2902());
+    
+    pForceChar = pService->createCharacteristic(
+        CHAR_FORCE_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pForceChar->addDescriptor(new BLE2902());
+    
+    pDistanceChar = pService->createCharacteristic(
+        CHAR_DISTANCE_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pDistanceChar->addDescriptor(new BLE2902());
+    
+    pTimeChar = pService->createCharacteristic(
+        CHAR_TIME_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pTimeChar->addDescriptor(new BLE2902());
+    
+    pService->start();
+    
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->start();
+    
+    Serial.println("BLE ready - device name: ESP32-Stepper");
+}
+
+void sendBLEData() {
+    if (!bleConnected) return;
+    
+    float elapsedTime = (millis() - bleStartTime) / 1000.0f;
+    float distance = stepCounter * MM_PER_STEP;
+    
+    // 发送数据 (little-endian float32)
+    pSpeedChar->setValue((uint8_t*)&currentSpeed, sizeof(float));
+    pSpeedChar->notify();
+    
+    pForceChar->setValue((uint8_t*)&forceReading, sizeof(float));
+    pForceChar->notify();
+    
+    pDistanceChar->setValue((uint8_t*)&distance, sizeof(float));
+    pDistanceChar->notify();
+    
+    pTimeChar->setValue((uint8_t*)&elapsedTime, sizeof(float));
+    pTimeChar->notify();
+}
+
+// ==================== Phyphox 实验模式 ====================
+
+void startPhyphoxMode() {
+    Serial.println("\n>>> PHYPHOX MODE START <<<");
+    Serial.println("Connect with Phyphox app!");
+    
+    phyphoxMode = true;
+    bleStartTime = millis();
+    stepCounter = 0;
+    
+    // 启动电机 (可选)
+    setDirection(direction);
+    enableMotor(true);
+    isRunning = true;
+    runStartTime = millis();
+    
+    currentMenu = MENU_RUNNING;
+}
+
+void stopPhyphoxMode() {
+    Serial.println(">>> PHYPHOX MODE STOP <<<");
+    phyphoxMode = false;
+    isRunning = false;
+    
+    // 锁定电机
+    enableMotor(true);
+    motorLocked = true;
+    
+    currentMenu = MENU_COMPLETED;
+}
+
+void updatePhyphox() {
+    // 更新运动参数
+    if (isRunning && !isPaused) {
+        updateMotionParams();
+    }
+    
+    // 发送 BLE 数据
+    if (millis() - lastBLETime >= BLE_INTERVAL) {
+        lastBLETime = millis();
+        sendBLEData();
+    }
+    
+    // 检查是否完成
+    uint32_t elapsedMs = millis() - runStartTime;
+    uint32_t totalMs = targetTime * 1000;
+    if (motionMode == MODE_CONTINUOUS && elapsedMs >= totalMs) {
+        stopPhyphoxMode();
+    }
+}
+
+// ==================== 硬件定时器 ====================
+
+// 快速伪随机数生成 (在中断中使用)
+static inline uint32_t IRAM_ATTR fastRandom() {
+    ditherSeed = ditherSeed * 1103515245 + 12345;
+    return (ditherSeed >> 16) & 0x7FFF;
+}
+
+void IRAM_ATTR onStepTimer() {
+    // 在中断中产生步进脉冲 - 极其稳定
+    portENTER_CRITICAL_ISR(&timerMux);
+
+    // 扫描模式、Phyphox模式或正常运行模式都需要产生脉冲
+    if ((isRunning || resonanceScanMode || phyphoxMode) && !isPaused && stepInterval < 100000) {
+        GPIO.out_w1ts = (1 << PIN_STEP);  // STEP HIGH (直接寄存器操作更快)
+        for (volatile int i = 0; i < 10; i++);  // 短延时约200ns
+        GPIO.out_w1tc = (1 << PIN_STEP);  // STEP LOW
+        stepCounter++;
+
+        // 扫描模式：不加抖动，让用户感受原始共振
+        // Phyphox模式：不加抖动，保证力传感器读数精确
+        // 正常运行：
+        //   - 加速/减速阶段：不加抖动（最平滑）
+        //   - 匀速阶段：加微量抖动打破共振
+        if (resonanceScanMode || phyphoxMode || isInAcceleration) {
+            // 不加抖动，保持固定间隔 - 最平滑
+            timerAlarmWrite(stepTimer, stepInterval, true);
+        } else {
+            // 匀速阶段：脉冲抖动打破共振（减至±8μs）
+            uint32_t dither = (fastRandom() % (DITHER_AMOUNT * 2)) - DITHER_AMOUNT;
+            uint32_t nextInterval = stepInterval + dither;
+            if (nextInterval < 50) nextInterval = 50;  // 最小50微秒
+            timerAlarmWrite(stepTimer, nextInterval, true);
+        }
+    }
+    portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+void initTimer() {
+    // 使用定时器0，80分频 = 1MHz (1微秒精度)
+    stepTimer = timerBegin(0, 80, true);
+    timerAttachInterrupt(stepTimer, &onStepTimer, true);
+    timerAlarmWrite(stepTimer, 1000, true);  // 初始1000微秒
+    timerAlarmEnable(stepTimer);
+    Serial.println("Hardware timer initialized");
+}
+
+void initOLED() {
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+        Serial.println("OLED failed!");
+        return;
+    }
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println(F("ESP32-C3 UPS Sim"));
-    display.println(F("Megatec Q1 Protocol"));
-    display.println(F(""));
-    display.println(F("Initializing..."));
+    display.println(F("Stepper Controller"));
+    display.println(F("Ready!"));
     display.display();
-    delay(1000);
+    delay(500);
 }
 
-// ==================== 传感器读取 ====================
+void enableMotor(bool en) {
+    digitalWrite(PIN_ENABLE, en ? LOW : HIGH);
+    Serial.print("Motor: "); Serial.println(en ? "ENABLED" : "DISABLED");
+}
 
-// 中值滤波 + 移动平均滤波
-float applyFilter(float newValue, float* buffer, int size) {
-    // 更新缓冲区
-    buffer[filterIndex % size] = newValue;
+void setDirection(bool dir) {
+    digitalWrite(PIN_DIR, dir ? HIGH : LOW);
+    delay(1);  // 等待方向稳定
+}
+
+// ==================== S曲线速度计算 ====================
+
+// 检查是否在共振区
+bool isInResonanceZone(float speed) {
+    return (speed >= RESONANCE_ZONE1_LOW && speed <= RESONANCE_ZONE1_HIGH) ||
+           (speed >= RESONANCE_ZONE2_LOW && speed <= RESONANCE_ZONE2_HIGH);
+}
+
+// Sigmoid平滑函数：用于共振区平滑过渡
+// 返回 0-1 之间的值，在边界处平滑过渡
+float sigmoidTransition(float x, float center, float width) {
+    // 使用双曲正切函数实现平滑S型过渡
+    // x: 当前速度
+    // center: 过渡中心点
+    // width: 过渡宽度
+    float t = (x - center) / (width * 0.5f);
+    float sig = tanh(t);  // tanh返回 -1 到 1
+    return (sig + 1.0f) * 0.5f;  // 归一化到 0 到 1
+}
+
+// 7次多项式平滑曲线（比5次多项式更平滑，jerk变化更小）
+// 这是最小jerk轨迹的7阶多项式
+float smoothStep7thOrder(float t) {
+    // 7次多项式: -20t^7 + 70t^6 - 84t^5 + 35t^4
+    // 边界条件：f(0)=0, f(1)=1, f'(0)=f'(1)=0, f''(0)=f''(1)=0
+    return t * t * t * t * (t * (t * (t * -20.0f + 70.0f) - 84.0f) + 35.0f);
+}
+
+// 计算共振区平滑补偿系数（返回1.0表示无补偿，>1.0表示加速通过）
+float calculateResonanceCompensation(float speed, float targetSpeed) {
+    // 如果不在共振区附近，返回1.0（无补偿）
+    if (speed < RESONANCE_ZONE1_LOW - RESONANCE_TRANSITION_WIDTH ||
+        (speed > RESONANCE_ZONE1_HIGH + RESONANCE_TRANSITION_WIDTH &&
+         speed < RESONANCE_ZONE2_LOW - RESONANCE_TRANSITION_WIDTH) ||
+        speed > RESONANCE_ZONE2_HIGH + RESONANCE_TRANSITION_WIDTH) {
+        return 1.0f;
+    }
+
+    float compensation = 1.0f;
+
+    // 第一共振区平滑过渡
+    if (speed >= RESONANCE_ZONE1_LOW - RESONANCE_TRANSITION_WIDTH &&
+        speed <= RESONANCE_ZONE1_HIGH + RESONANCE_TRANSITION_WIDTH) {
+
+        float zoneCenter = (RESONANCE_ZONE1_LOW + RESONANCE_ZONE1_HIGH) * 0.5f;
+        float zoneWidth = RESONANCE_ZONE1_HIGH - RESONANCE_ZONE1_LOW + RESONANCE_TRANSITION_WIDTH * 2.0f;
+
+        // 计算在共振区中的位置（0到1）
+        float position = (speed - (RESONANCE_ZONE1_LOW - RESONANCE_TRANSITION_WIDTH)) / zoneWidth;
+
+        // 使用高斯形状的补偿曲线，中心补偿最大
+        float gaussian = exp(-pow(position - 0.5f, 2) * 8.0f);  // 高斯曲线
+
+        // 补偿系数：中心最大1.3倍，边缘1.0倍
+        compensation = 1.0f + (RESONANCE_ACCEL_BOOST - 1.0f) * gaussian;
+    }
+    // 第二共振区平滑过渡
+    else if (speed >= RESONANCE_ZONE2_LOW - RESONANCE_TRANSITION_WIDTH &&
+             speed <= RESONANCE_ZONE2_HIGH + RESONANCE_TRANSITION_WIDTH) {
+
+        float zoneCenter = (RESONANCE_ZONE2_LOW + RESONANCE_ZONE2_HIGH) * 0.5f;
+        float zoneWidth = RESONANCE_ZONE2_HIGH - RESONANCE_ZONE2_LOW + RESONANCE_TRANSITION_WIDTH * 2.0f;
+
+        float position = (speed - (RESONANCE_ZONE2_LOW - RESONANCE_TRANSITION_WIDTH)) / zoneWidth;
+        float gaussian = exp(-pow(position - 0.5f, 2) * 8.0f);
+
+        compensation = 1.0f + (RESONANCE_ACCEL_BOOST - 1.0f) * gaussian;
+    }
+
+    return compensation;
+}
+
+float sCurveSpeed(uint32_t elapsedMs, uint32_t accelMs, uint32_t totalMs, float maxSpeed) {
+    // 计算速度范围 (从最小起步速度到最大速度)
+    float speedRange = maxSpeed - MIN_START_SPEED;
+    float baseSpeed;
+
+    // 判断是否在加速/减速阶段
+    bool accelerating = (elapsedMs < accelMs) || (elapsedMs > totalMs - accelMs);
+
+    if (elapsedMs < accelMs) {
+        // ========== 加速阶段 ==========
+        float t = (float)elapsedMs / accelMs;
+        // 使用7次多项式实现更平滑的加速（jerk-limited）
+        float smooth = smoothStep7thOrder(t);
+        baseSpeed = MIN_START_SPEED + speedRange * smooth;
+
+        // 平滑的共振区补偿（而不是突跳）
+        float compensation = calculateResonanceCompensation(baseSpeed, maxSpeed);
+
+        // 应用补偿：通过调整"虚拟时间"来加速通过共振区
+        if (compensation > 1.01f) {  // 只有补偿明显时才应用
+            // 在S曲线基础上应用微小的速度提升
+            float speedBoost = (baseSpeed - MIN_START_SPEED) * (compensation - 1.0f) * 0.3f;
+            baseSpeed += speedBoost;
+        }
+
+        isInAcceleration = true;
+    } else if (elapsedMs > totalMs - accelMs) {
+        // ========== 减速阶段 ==========
+        float t = (float)(totalMs - elapsedMs) / accelMs;
+        float smooth = smoothStep7thOrder(t);
+        baseSpeed = MIN_START_SPEED + speedRange * smooth;
+
+        // 减速阶段同样应用共振区补偿，确保平滑通过
+        float compensation = calculateResonanceCompensation(baseSpeed, maxSpeed);
+        if (compensation > 1.01f) {
+            float speedBoost = (baseSpeed - MIN_START_SPEED) * (compensation - 1.0f) * 0.3f;
+            baseSpeed += speedBoost;
+        }
+
+        isInAcceleration = true;
+    } else {
+        // ========== 匀速阶段 ==========
+        baseSpeed = maxSpeed;
+        isInAcceleration = false;
+    }
+
+    // 限制在合理范围内
+    baseSpeed = constrain(baseSpeed, MIN_START_SPEED, maxSpeed);
+
+    return baseSpeed;
+}
+
+uint32_t speedToInterval(float speed) {
+    if (speed < 0.1) return 100000;
+    float stepsPerSec = speed * STEPS_PER_MM;
+    return (uint32_t)(1000000.0 / stepsPerSec);
+}
+
+// ==================== 运动控制 ====================
+
+void startMotion() {
+    Serial.println("\n>>> START MOTION <<<");
     
-    // 复制数组用于排序
-    float sorted[FILTER_SIZE];
-    int validCount = filterFilled ? size : (filterIndex % size) + 1;
-    for (int i = 0; i < validCount; i++) {
-        sorted[i] = buffer[i];
+    isRunning = true;
+    isPaused = false;
+    stepCounter = 0;
+    reciprocateCount = 0;
+    runStartTime = millis();
+    stepInterval = 100000;  // 初始慢速
+    currentSpeed = 0;
+    
+    setDirection(direction);
+    enableMotor(true);
+    
+    currentMenu = MENU_RUNNING;
+    
+    Serial.print("Target speed: "); Serial.print(targetSpeed); Serial.println(" mm/s");
+    Serial.print("Target time: "); Serial.print(targetTime); Serial.println(" s");
+    Serial.print("Accel time: "); Serial.print(accelTime); Serial.println(" ms");
+}
+
+void stopMotion() {
+    Serial.println(">>> STOP MOTION <<<");
+    isRunning = false;
+    isPaused = false;
+    
+    // 运行结束后锁定电机（保持使能，防止滑动）
+    enableMotor(true);
+    motorLocked = true;
+    Serial.println("Motor LOCKED (holding position)");
+    
+    currentMenu = MENU_COMPLETED;
+    
+    float dist = stepCounter * MM_PER_STEP;
+    uint32_t elapsed = millis() - runStartTime;
+    Serial.print("Steps: "); Serial.println(stepCounter);
+    Serial.print("Distance: "); Serial.print(dist); Serial.println(" mm");
+    Serial.print("Time: "); Serial.print(elapsed / 1000.0); Serial.println(" s");
+}
+
+// ==================== 共振扫描 ====================
+
+void startResonanceScan() {
+    Serial.println("\n>>> RESONANCE SCAN START <<<");
+    Serial.println("Scanning from 5 to 150 mm/s");
+    Serial.println("Watch/listen for vibration peaks!");
+    
+    resonanceScanMode = true;
+    scanSpeed = SCAN_MIN_SPEED;
+    lastScanStepTime = millis();
+    stepCounter = 0;
+    
+    setDirection(true);
+    enableMotor(true);
+    
+    // 设置初始速度
+    stepInterval = speedToInterval(scanSpeed);
+    timerAlarmWrite(stepTimer, stepInterval, true);
+    
+    currentMenu = MENU_RUNNING;
+}
+
+void updateResonanceScan() {
+    // 每隔一段时间增加速度
+    if (millis() - lastScanStepTime >= SCAN_HOLD_MS) {
+        lastScanStepTime = millis();
+        scanSpeed += SCAN_STEP;
+        
+        // 更新定时器间隔 (不使用共振补偿，这样能感受到原始共振)
+        stepInterval = speedToInterval(scanSpeed);
+        timerAlarmWrite(stepTimer, stepInterval, true);
+        currentSpeed = scanSpeed;
+        
+        // 串口输出当前速度和频率，方便记录
+        float freq = scanSpeed * STEPS_PER_MM;
+        Serial.print("Speed: ");
+        Serial.print(scanSpeed, 1);
+        Serial.print(" mm/s  Freq: ");
+        Serial.print(freq, 0);
+        Serial.println(" Hz");
+        
+        // 扫描完成
+        if (scanSpeed >= SCAN_MAX_SPEED) {
+            Serial.println(">>> RESONANCE SCAN COMPLETE <<<");
+            resonanceScanMode = false;
+            enableMotor(false);
+            currentMenu = MENU_COMPLETED;
+        }
+    }
+}
+
+void runMotorStep() {
+    updateMotionParams();
+}
+
+// 更新运动参数（定时器负责产生脉冲）
+void updateMotionParams() {
+    uint32_t elapsedMs = (millis() - runStartTime);
+    uint32_t totalMs = targetTime * 1000;
+    
+    // 检查是否完成
+    if (motionMode == MODE_CONTINUOUS && elapsedMs >= totalMs) {
+        stopMotion();
+        return;
     }
     
-    // 简单冒泡排序
-    for (int i = 0; i < validCount - 1; i++) {
-        for (int j = 0; j < validCount - i - 1; j++) {
-            if (sorted[j] > sorted[j + 1]) {
-                float temp = sorted[j];
-                sorted[j] = sorted[j + 1];
-                sorted[j + 1] = temp;
+    if (motionMode == MODE_DISTANCE) {
+        float dist = stepCounter * MM_PER_STEP;
+        if (dist >= targetDistance) {
+            stopMotion();
+            return;
+        }
+    }
+    
+    if (motionMode == MODE_RECIPROCATE) {
+        float dist = stepCounter * MM_PER_STEP;
+        if (dist >= targetDistance) {
+            // 换向
+            direction = !direction;
+            setDirection(direction);
+            stepCounter = 0;
+            reciprocateCount++;
+            
+            // 检查时间是否到
+            if (elapsedMs >= totalMs) {
+                stopMotion();
+                return;
             }
         }
     }
     
-    // 去掉最大最小值，取中间值平均
-    if (validCount >= 4) {
-        float sum = 0;
-        for (int i = 1; i < validCount - 1; i++) {
-            sum += sorted[i];
+    // 计算当前速度
+    currentSpeed = sCurveSpeed(elapsedMs, accelTime, totalMs, targetSpeed);
+    
+    // 计算步进间隔并更新定时器
+    stepInterval = speedToInterval(currentSpeed);
+    timerAlarmWrite(stepTimer, stepInterval, true);
+}
+
+// ==================== 按键处理 ====================
+
+void processButtons() {
+    if (millis() - lastButtonTime < 150) return;
+    
+    bool up = !digitalRead(PIN_BTN_UP);
+    bool down = !digitalRead(PIN_BTN_DOWN);
+    bool enter = !digitalRead(PIN_BTN_ENTER);
+    bool back = !digitalRead(PIN_BTN_BACK);
+    
+    if (!up && !down && !enter && !back) return;
+    
+    lastButtonTime = millis();
+    
+    // 运行中、扫描中或Phyphox模式只响应暂停/停止
+    if (isRunning || resonanceScanMode || phyphoxMode) {
+        if (enter && (isRunning || phyphoxMode)) {
+            isPaused = !isPaused;
+            if (isPaused) {
+                enableMotor(false);
+                Serial.println("PAUSED");
+            } else {
+                enableMotor(true);
+                Serial.println("RESUMED");
+            }
         }
-        return sum / (validCount - 2);
-    } else {
-        // 数据不足时直接返回中值
-        return sorted[validCount / 2];
-    }
-}
-
-void readSensors() {
-    if (!inaConnected) {
-        // 尝试重新连接
-        initINA226();
+        if (back) {
+            if (resonanceScanMode) {
+                resonanceScanMode = false;
+                enableMotor(false);
+                Serial.println("Scan stopped");
+            } else if (phyphoxMode) {
+                stopPhyphoxMode();
+            } else {
+                stopMotion();
+            }
+            currentMenu = MENU_MAIN;
+        }
         return;
     }
     
-    // 读取 INA226 原始数据
-    float rawVoltage = ina226.getBusVoltage();
-    float rawCurrent = ina226.getCurrent();
-    float rawPower = ina226.getPower();
-    
-    // 检查读数有效性
-    if (isnan(rawVoltage) || rawVoltage < 0 || rawVoltage > 30) {
-        // 无效数据，跳过本次更新
+    // 完成界面
+    // 校准界面
+    if (currentMenu == MENU_CALIBRATE) {
+        if (enter) {
+            doCalibrationStep();
+        }
+        if (back) {
+            cancelCalibration();
+        }
         return;
     }
     
-    // 修正负值 (根据电流方向)
-    if (rawCurrent < 0) {
-        rawCurrent = -rawCurrent;
-    }
-    if (rawPower < 0) {
-        rawPower = -rawPower;
-    }
-    
-    // 应用滤波
-    float filteredVoltage = applyFilter(rawVoltage, voltageBuffer, FILTER_SIZE);
-    float filteredCurrent = applyFilter(rawCurrent, currentBuffer, FILTER_SIZE);
-    float filteredPower = applyFilter(rawPower, powerBuffer, FILTER_SIZE);
-    
-    // 应用校准系数
-    busVoltage = filteredVoltage * VOLTAGE_CALIBRATION;
-    shuntCurrent = filteredCurrent * CURRENT_CALIBRATION;
-    power = busVoltage * shuntCurrent;  // 重新计算功率以确保一致性
-    
-    // 更新滤波索引
-    filterIndex++;
-    if (filterIndex >= FILTER_SIZE) {
-        filterFilled = true;
-    }
-}
-
-// ==================== UPS 状态更新 ====================
-
-void updateUPSStatus() {
-    // 判断是否为电池供电模式
-    // 当电压低于阈值时，认为市电已断开
-    if (busVoltage < AC_ONLINE_THRESHOLD && busVoltage > 0) {
-        onBattery = true;
-    } else if (busVoltage >= MAINS_OK_THRESHOLD || busVoltage == 0) {
-        onBattery = false;
+    if (currentMenu == MENU_COMPLETED) {
+        if (enter || back) {
+            currentMenu = MENU_MAIN;
+        }
+        return;
     }
     
-    // 判断电池电量是否过低 (触发 NAS 关机)
-    if (busVoltage < LOW_BATTERY_THRESHOLD && busVoltage > 0) {
-        lowBattery = true;
-    } else {
-        lowBattery = false;
+    // 主菜单
+    if (up) {
+        menuIndex = (menuIndex - 1 + MENU_ITEMS) % MENU_ITEMS;
+        // 更新滚动偏移
+        if (menuIndex < menuScrollOffset) {
+            menuScrollOffset = menuIndex;
+        }
+        if (menuIndex >= menuScrollOffset + VISIBLE_ITEMS) {
+            menuScrollOffset = menuIndex - VISIBLE_ITEMS + 1;
+        }
     }
-}
-
-// ==================== 串口命令处理 ====================
-
-void processSerialCommand(String cmd) {
-    cmd.trim();
-    
-    if (cmd == "Q1") {
-        // 状态查询 (Megatec Q1 协议核心命令)
-        sendQ1Response();
-    }
-    else if (cmd == "I") {
-        // 型号查询
-        sendInfoResponse();
-    }
-    else if (cmd == "F") {
-        // 额定值查询
-        sendRatingResponse();
-    }
-    else if (cmd == "T") {
-        // 10秒测试 (模拟)
-        Serial.print("OK\r");
-    }
-    else if (cmd == "TL") {
-        // 持续测试直到电量低 (模拟)
-        Serial.print("OK\r");
-    }
-    else if (cmd == "Q") {
-        // 取消测试
-        Serial.print("OK\r");
-    }
-    else if (cmd == "C") {
-        // 取消关机
-        Serial.print("OK\r");
-    }
-    // 其他未知命令静默忽略
-}
-
-// ==================== Q1 响应 (状态查询) ====================
-
-void sendQ1Response() {
-    // Megatec Q1 响应格式:
-    // (MMM.M NNN.N PPP.P QQQ RR.R S.S TT.T b7b6b5b4b3b2b1b0\r
-    //
-    // MMM.M - 输入电压 (V)
-    // NNN.N - 输入故障电压 (V)
-    // PPP.P - 输出电压 (V)
-    // QQQ   - 负载百分比 (%)
-    // RR.R  - 频率 (Hz)
-    // S.S   - 电池电压 (V) (按 12V 铅酸电池格式)
-    // TT.T  - 温度 (°C)
-    // b7-b0 - 状态位
-    
-    char response[64];
-    
-    // 输入电压: 如果电池电压 > 11V，认为市电在线
-    String inputVoltage = (busVoltage > MAINS_OK_THRESHOLD) ? "220.0" : "000.0";
-    String faultVoltage = inputVoltage; // 故障电压同输入电压
-    
-    // 输出电压: 使用 INA226 读取的实际电压
-    String outputVoltage = formatFloat(busVoltage, 5, 1);
-    
-    // 负载百分比: (功率 / 最大功率) * 100
-    int loadPercent = (int)((power / SIMULATED_MAX_POWER) * 100);
-    if (loadPercent > 100) loadPercent = 100;
-    if (loadPercent < 0) loadPercent = 0;
-    
-    // 频率: 固定 50Hz
-    String frequency = "50.0";
-    
-    // 电池电压: 模拟 12V 铅酸电池
-    // 将实际电压映射到铅酸电池范围 (10.5V - 14.4V)
-    float simBatteryVoltage = busVoltage;
-    if (simBatteryVoltage > 14.4) simBatteryVoltage = 14.4;
-    if (simBatteryVoltage < 0) simBatteryVoltage = 0;
-    String batteryVoltage = formatFloat(simBatteryVoltage, 4, 1);
-    
-    // 温度: 读取 ESP32-C3 内部温度或固定值
-    float temperature = temperatureRead(); // ESP32-C3 内部温度传感器
-    if (isnan(temperature) || temperature < -40 || temperature > 85) {
-        temperature = 25.0;
-    }
-    String tempStr = formatFloat(temperature, 4, 1);
-    
-    // 构建状态位 (8位二进制)
-    // Bit 7: 1=电池供电, 0=市电
-    // Bit 6: 1=电量低, 0=电量正常
-    // Bit 5: 1=旁路/稳压激活, 0=正常
-    // Bit 4: 1=UPS故障, 0=正常
-    // Bit 3: 1=UPS类型为待机/在线, 0=在线
-    // Bit 2: 1=测试进行中, 0=无测试
-    // Bit 1: 1=关机激活, 0=正常
-    // Bit 0: 1=蜂鸣器静音, 0=蜂鸣器启用
-    
-    uint8_t statusBits = 0;
-    
-    if (onBattery) {
-        statusBits |= 0x80;  // Bit 7: 电池供电
+    if (down) {
+        menuIndex = (menuIndex + 1) % MENU_ITEMS;
+        // 更新滚动偏移
+        if (menuIndex < menuScrollOffset) {
+            menuScrollOffset = menuIndex;
+        }
+        if (menuIndex >= menuScrollOffset + VISIBLE_ITEMS) {
+            menuScrollOffset = menuIndex - VISIBLE_ITEMS + 1;
+        }
     }
     
-    if (lowBattery) {
-        statusBits |= 0x40;  // Bit 6: 电量低
-    }
-    
-    // Bit 3: 设为 1 表示这是待机/离线 UPS
-    statusBits |= 0x08;
-    
-    // 转换为二进制字符串
-    char statusStr[9];
-    for (int i = 7; i >= 0; i--) {
-        statusStr[7 - i] = (statusBits & (1 << i)) ? '1' : '0';
-    }
-    statusStr[8] = '\0';
-    
-    // 构建完整响应
-    // 格式: (MMM.M NNN.N PPP.P QQQ RR.R SS.S TT.T b7b6b5b4b3b2b1b0
-    snprintf(response, sizeof(response), 
-             "(%s %s %s %03d %s %s %s %s\r",
-             inputVoltage.c_str(),
-             faultVoltage.c_str(),
-             outputVoltage.c_str(),
-             loadPercent,
-             frequency.c_str(),
-             batteryVoltage.c_str(),
-             tempStr.c_str(),
-             statusStr);
-    
-    Serial.print(response);
-}
-
-// ==================== I 响应 (型号信息) ====================
-
-void sendInfoResponse() {
-    Serial.print("#Simulated_UPS_ESP32C3\r");
-}
-
-// ==================== F 响应 (额定值) ====================
-
-void sendRatingResponse() {
-    // 格式: #MMM.M QQQ SS.SS RR.R
-    // MMM.M - 额定电压 (V)
-    // QQQ   - 额定电流 (A)
-    // SS.SS - 电池电压 (V)
-    // RR.R  - 频率 (Hz)
-    Serial.print("#220.0 005 012.0 50.0\r");
-}
-
-// ==================== 中文显示函数 ====================
-
-/**
- * 绘制单个中文字符 (3列 x 12行，每列5位有效)
- * @param x X 坐标
- * @param y Y 坐标
- * @param charData 字符数据 [3][12]
- */
-void drawChineseChar(int x, int y, const uint8_t charData[3][12]) {
-    for (int col = 0; col < 3; col++) {
-        for (int row = 0; row < 12; row++) {
-            uint8_t byte = charData[col][row];
-            // 每字节5位有效数据 (bit4-bit0)
-            for (int bit = 0; bit < 5; bit++) {
-                if (byte & (0x10 >> bit)) {
-                    display.drawPixel(x + col * 5 + bit, y + row, SSD1306_WHITE);
+    if (enter) {
+        switch (menuIndex) {
+            case 0: targetSpeed = constrain(targetSpeed + 5, 1, 200); break;
+            case 1: targetDistance = constrain(targetDistance + 10, 1, 400); break;
+            case 2: targetTime = constrain(targetTime + 1, 1, 3600); break;
+            case 3: accelTime = constrain(accelTime + 50, 100, 2000); break;
+            case 4: direction = !direction; break;
+            case 5: motionMode = (MotionMode)((motionMode + 1) % 3); break;
+            case 6: startResonanceScan(); break;  // 共振扫描
+            case 7: startPhyphoxMode(); break;    // Phyphox 实验模式
+            case 8: tareForce(); break;           // 力传感器归零
+            case 9: startCalibration(); break;    // 力传感器校准
+            case 10:  // 解锁电机
+                if (motorLocked) {
+                    enableMotor(false);
+                    motorLocked = false;
+                    Serial.println("Motor UNLOCKED");
                 }
-            }
+                break;
+            case 11: startMotion(); break;        // START
+        }
+    }
+    
+    if (back) {
+        switch (menuIndex) {
+            case 0: targetSpeed = constrain(targetSpeed - 5, 1, 200); break;
+            case 1: targetDistance = constrain(targetDistance - 10, 1, 400); break;
+            case 2: targetTime = constrain(targetTime - 1, 1, 3600); break;
+            case 3: accelTime = constrain(accelTime - 50, 100, 2000); break;
+            case 4: direction = !direction; break;
+            case 5: motionMode = (MotionMode)((motionMode + 2) % 3); break;
         }
     }
 }
 
-// ==================== OLED 显示更新 ====================
+// ==================== 显示更新 ====================
 
 void updateDisplay() {
+    // 注意：时间限制已在 loop() 中通过 lastDisplayTime 处理
+    // 这里不再重复检查
+    
     display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
     
-    // 传感器数据区
-    if (inaConnected) {
-        // 电压行: "电压:" + 数值 (电 + 压 = 15+15 = 30像素宽)
-        drawChineseChar(0, 0, char_dian);    // 电
-        drawChineseChar(16, 0, char_ya);     // 压
-        display.setCursor(34, 2);
-        display.print(busVoltage, 2);
-        display.print(" V");
-        
-        // 电流行: "电流:" + 数值
-        drawChineseChar(0, 14, char_dian);   // 电
-        drawChineseChar(16, 14, char_liu);   // 流
-        display.setCursor(34, 16);
-        display.print(shuntCurrent * 1000, 1);
-        display.print(" mA");
-        
-        // 功率行: "功率:" + 数值
-        drawChineseChar(0, 28, char_gong);   // 功
-        drawChineseChar(16, 28, char_lv);    // 率
-        display.setCursor(34, 30);
-        display.print(power, 2);
-        display.print(" W");
+    if (calibrationMode) {
+        drawCalibrationScreen();
+    } else if (phyphoxMode) {
+        drawPhyphoxScreen();
+    } else if (resonanceScanMode) {
+        drawScanScreen();
     } else {
-        display.setCursor(0, 0);
-        display.print("INA226 OFFLINE");
-        display.setCursor(0, 12);
-        display.print("Check I2C wiring");
-        display.setCursor(0, 24);
-        display.print("Addr: 0x44");
-    }
-    
-    // 分隔线
-    display.drawLine(0, 44, 127, 44, SSD1306_WHITE);
-    
-    // 状态栏 (底部)
-    if (lowBattery) {
-        // 电量低警告: 电量低警告
-        drawChineseChar(4, 48, char_dian);    // 电
-        drawChineseChar(20, 48, char_liang);  // 量
-        drawChineseChar(36, 48, char_di);     // 低
-        drawChineseChar(52, 48, char_jing);   // 警
-        drawChineseChar(68, 48, char_gao);    // 告
-    } else if (onBattery) {
-        // 电池供电模式
-        drawChineseChar(4, 48, char_dian);    // 电
-        drawChineseChar(20, 48, char_chi);    // 池
-        drawChineseChar(36, 48, char_gong2);  // 供
-        drawChineseChar(52, 48, char_dian);   // 电
-        drawChineseChar(68, 48, char_mo);     // 模
-        drawChineseChar(84, 48, char_shi2);   // 式
-    } else {
-        // 市电正常模式
-        drawChineseChar(4, 48, char_shi);     // 市
-        drawChineseChar(20, 48, char_dian);   // 电
-        drawChineseChar(36, 48, char_zheng);  // 正
-        drawChineseChar(52, 48, char_chang);  // 常
-        drawChineseChar(68, 48, char_mo);     // 模
-        drawChineseChar(84, 48, char_shi2);   // 式
+        switch (currentMenu) {
+            case MENU_MAIN:
+                drawMainMenu();
+                break;
+            case MENU_RUNNING:
+                drawRunningScreen();
+                break;
+            case MENU_COMPLETED:
+                drawCompletedScreen();
+                break;
+            case MENU_CALIBRATE:
+                drawCalibrationScreen();
+                break;
+        }
     }
     
     display.display();
 }
 
-// ==================== 辅助函数 ====================
-
-/**
- * 格式化浮点数为固定宽度字符串
- * @param value 浮点数值
- * @param width 总宽度
- * @param decimals 小数位数
- * @return 格式化后的字符串
- */
-String formatFloat(float value, int width, int decimals) {
-    char buffer[16];
-    dtostrf(value, width, decimals, buffer);
+void drawMainMenu() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);  // 确保先设置正确的颜色
+    display.setCursor(0, 0);
     
-    // 替换前导空格为0 (Megatec 协议要求)
-    for (int i = 0; i < strlen(buffer); i++) {
-        if (buffer[i] == ' ') {
-            buffer[i] = '0';
-        } else {
-            break; // 只替换前导空格
-        }
+    // 标题栏显示锁定状态
+    if (motorLocked) {
+        display.println(F("== CTRL [LOCKED] =="));
+    } else {
+        display.println(F("== STEPPER CTRL =="));
     }
     
-    return String(buffer);
+    // 只显示可见的菜单项（支持滚动）
+    for (int v = 0; v < VISIBLE_ITEMS && (menuScrollOffset + v) < MENU_ITEMS; v++) {
+        int i = menuScrollOffset + v;
+        display.setCursor(0, 9 + v * 8);
+        
+        if (i == menuIndex) {
+            display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // 选中项：反色显示
+        } else {
+            display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // 非选中项：正常显示（指定背景色）
+        }
+        
+        // 显示菜单项和值
+        char buf[22];
+        switch (i) {
+            case 0: snprintf(buf, sizeof(buf), " Speed:   %3d mm/s", (int)targetSpeed); break;
+            case 1: snprintf(buf, sizeof(buf), " Distance:%3d mm", (int)targetDistance); break;
+            case 2: snprintf(buf, sizeof(buf), " Time:    %3d s", (int)targetTime); break;
+            case 3: snprintf(buf, sizeof(buf), " Accel:   %4d ms", (int)accelTime); break;
+            case 4: snprintf(buf, sizeof(buf), " Dir: %s", direction ? "FWD" : "REV"); break;
+            case 5: 
+                snprintf(buf, sizeof(buf), " Mode:%s", 
+                    motionMode == MODE_CONTINUOUS ? "Cont" :
+                    motionMode == MODE_DISTANCE ? "Dist" : "Recip");
+                break;
+            case 6: snprintf(buf, sizeof(buf), " >> ResoScan <<"); break;
+            case 7: snprintf(buf, sizeof(buf), " >> Phyphox <<"); break;
+            case 8: snprintf(buf, sizeof(buf), " [Tare] %.3fN", forceReading); break;
+            case 9: snprintf(buf, sizeof(buf), " [Calib] 100g"); break;
+            case 10: snprintf(buf, sizeof(buf), " [%s]", motorLocked ? "Unlock" : "Unlocked"); break;
+            case 11: snprintf(buf, sizeof(buf), " >>> START <<<"); break;
+        }
+        display.print(buf);
+    }
+    
+    // 显示滚动指示器
+    display.setTextColor(SSD1306_WHITE);
+    if (menuScrollOffset > 0) {
+        display.setCursor(120, 9);
+        display.print(F("^"));
+    }
+    if (menuScrollOffset + VISIBLE_ITEMS < MENU_ITEMS) {
+        display.setCursor(120, 55);
+        display.print(F("v"));
+    }
+}
+
+void drawRunningScreen() {
+    uint32_t elapsed = millis() - runStartTime;
+    float dist = stepCounter * MM_PER_STEP;
+    
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // 设置颜色
+    display.setCursor(0, 0);
+    
+    if (isPaused) {
+        display.println(F("==== PAUSED ===="));
+    } else {
+        display.println(F("=== RUNNING ==="));
+    }
+    
+    display.setCursor(0, 12);
+    display.print(F("Speed: "));
+    display.print(currentSpeed, 1);
+    display.println(F(" mm/s"));
+    
+    display.print(F("Dist:  "));
+    display.print(dist, 1);
+    display.println(F(" mm"));
+    
+    display.print(F("Time:  "));
+    display.print(elapsed / 1000.0, 1);
+    display.print(F("/"));
+    display.print(targetTime);
+    display.println(F("s"));
+    
+    display.print(F("Steps: "));
+    display.println(stepCounter);
+    
+    if (motionMode == MODE_RECIPROCATE) {
+        display.print(F("Cycles: "));
+        display.println(reciprocateCount);
+    }
+    
+    // 进度条
+    display.drawRect(0, 54, 128, 10, SSD1306_WHITE);
+    float progress = (float)elapsed / (targetTime * 1000);
+    if (progress > 1.0) progress = 1.0;
+    display.fillRect(2, 56, (int)(124 * progress), 6, SSD1306_WHITE);
+}
+
+void drawPhyphoxScreen() {
+    float elapsed = (millis() - bleStartTime) / 1000.0f;
+    float dist = stepCounter * MM_PER_STEP;
+    
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // 设置颜色
+    display.setCursor(0, 0);
+    
+    if (bleConnected) {
+        display.println(F("== PHYPHOX [OK] =="));
+    } else {
+        display.println(F("== PHYPHOX [...]  =="));
+    }
+    
+    display.setCursor(0, 10);
+    display.print(F("Speed: "));
+    display.print(currentSpeed, 1);
+    display.println(F(" mm/s"));
+    
+    display.print(F("Force: "));
+    display.print(forceReading, 3);
+    display.println(F(" N"));
+    
+    display.print(F("Dist:  "));
+    display.print(dist, 1);
+    display.println(F(" mm"));
+    
+    display.print(F("Time:  "));
+    display.print(elapsed, 1);
+    display.println(F(" s"));
+    
+    display.setCursor(0, 50);
+    if (!bleConnected) {
+        display.println(F("Open Phyphox app..."));
+    } else {
+        display.println(F("[BACK]=Stop"));
+    }
+    
+    // 进度条
+    display.drawRect(0, 58, 128, 6, SSD1306_WHITE);
+    float progress = elapsed / targetTime;
+    if (progress > 1.0) progress = 1.0;
+    display.fillRect(2, 60, (int)(124 * progress), 2, SSD1306_WHITE);
+}
+
+void drawScanScreen() {
+    float freq = scanSpeed * STEPS_PER_MM;
+    
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // 设置颜色
+    display.setCursor(0, 0);
+    display.println(F("== RESONANCE SCAN =="));
+    
+    display.setCursor(0, 12);
+    display.print(F("Speed: "));
+    display.setTextSize(2);
+    display.print(scanSpeed, 1);
+    display.setTextSize(1);
+    display.println(F(" mm/s"));
+    
+    display.setCursor(0, 32);
+    display.print(F("Freq:  "));
+    display.print(freq, 0);
+    display.println(F(" Hz"));
+    
+    display.setCursor(0, 44);
+    display.println(F("Feel vibration? Note"));
+    display.println(F("the speed! [BACK]=Stop"));
+    
+    // 进度条
+    display.drawRect(0, 54, 128, 10, SSD1306_WHITE);
+    float progress = (scanSpeed - SCAN_MIN_SPEED) / (SCAN_MAX_SPEED - SCAN_MIN_SPEED);
+    display.fillRect(2, 56, (int)(124 * progress), 6, SSD1306_WHITE);
+}
+
+void drawCompletedScreen() {
+    float dist = stepCounter * MM_PER_STEP;
+    uint32_t elapsed = millis() - runStartTime;
+    
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // 设置颜色
+    display.setCursor(0, 0);
+    display.println(F("=== COMPLETED ==="));
+    
+    display.setCursor(0, 16);
+    display.print(F("Distance: "));
+    display.print(dist, 1);
+    display.println(F(" mm"));
+    
+    display.print(F("Time: "));
+    display.print(elapsed / 1000.0, 1);
+    display.println(F(" s"));
+    
+    display.print(F("Avg Speed: "));
+    if (elapsed > 0) {
+        display.print(dist / (elapsed / 1000.0), 1);
+    } else {
+        display.print(F("0"));
+    }
+    display.println(F(" mm/s"));
+    
+    display.print(F("Steps: "));
+    display.println(stepCounter);
+    
+    display.setCursor(0, 54);
+    display.println(F("Press any key..."));
+}
+
+void drawCalibrationScreen() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setCursor(0, 0);
+    display.println(F("== CALIBRATION =="));
+    
+    display.setCursor(0, 12);
+    
+    if (calibrationStep == 0) {
+        display.println(F("Step 1/2:"));
+        display.println(F(""));
+        display.println(F("Remove all weight"));
+        display.println(F("from sensor"));
+        display.println(F(""));
+        display.println(F("[ENTER] to confirm"));
+        display.println(F("[BACK] to cancel"));
+    } 
+    else if (calibrationStep == 1) {
+        display.println(F("Step 2/2:"));
+        display.println(F(""));
+        display.println(F("Place 100g weight"));
+        display.println(F("on sensor"));
+        display.println(F(""));
+        display.println(F("[ENTER] to confirm"));
+        display.println(F("[BACK] to cancel"));
+    }
+    else if (calibrationStep == 2) {
+        display.println(F("Calibration Done!"));
+        display.println(F(""));
+        display.print(F("Cal factor: "));
+        display.println(forceCalibration, 1);
+        display.println(F(""));
+        display.print(F("Force: "));
+        display.print(forceReading, 3);
+        display.println(F(" N"));
+        display.println(F(""));
+        display.println(F("[ENTER] to exit"));
+    }
 }

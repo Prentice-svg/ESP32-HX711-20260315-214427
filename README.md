@@ -1,214 +1,359 @@
-# ESP32-C3 SuperMini UPS Simulator
+# ESP32-WROOM-32E 步进电机调速仪
 
-基于 ESP32-C3 SuperMini 的 UPS 模拟器，实现 **Megatec Q1 协议**，可被飞牛NAS / Linux NUT 原生识别。
+基于 ESP32-WROOM-32E 的步进电机精密调速控制系统，采用 S 型加速曲线实现平滑启停。
 
 ## 功能特性
 
-- ✅ 完整 Megatec Q1 协议支持
-- ✅ INA226 电压/电流/功率实时监测
-- ✅ 0.96寸 OLED 状态显示
-- ✅ 自动市电/电池模式切换
-- ✅ 低电量告警（触发 NAS 关机）
-- ✅ 数字滤波稳定读数
+- 🎯 **精确速度控制**: 1-200 mm/s 可调
+- 📏 **精确距离控制**: 最大行程 400mm
+- ⏱️ **时间控制**: 1秒 - 1小时可调
+- 🔄 **S型加速曲线**: 100-2000ms 可调加速时间
+- 📊 **实时显示**: OLED 显示速度、距离、时间、进度
+- 🎮 **多种运动模式**:
+  - 连续模式: 按设定时间运行
+  - 定距模式: 运动到指定距离
+  - 往复模式: 在指定距离内往复运动
 
-## 硬件需求
+## 硬件配置
 
-| 组件 | 型号/规格 |
-|------|-----------|
-| MCU | ESP32-C3 SuperMini |
-| 电流传感器 | INA226 (I2C 地址 0x44) |
-| 采样电阻 | 0.025Ω (25mΩ) |
-| 显示屏 | 0.96寸 OLED SSD1306/SSD1315 |
+### 核心组件
 
-## 接线图
+| 组件 | 型号 | 说明 |
+|------|------|------|
+| MCU | ESP32-WROOM-32E | 双核 240MHz, 需USB-TTL |
+| 步进驱动 | DRV8825 | 1/16微步细分 |
+| 步进电机 | 17HS3401S | 1.8°步距角, 200步/圈 |
+| 显示 | 0.96" OLED | SSD1306 I2C |
+| 电源 | 12V DC | 电机供电 |
+
+### ESP32-WROOM-32E 特性
+
+| 参数 | 值 |
+|------|------|
+| 处理器 | 双核 Xtensa LX6 @ 240MHz |
+| Flash | 4MB |
+| SRAM | 520KB |
+| GPIO | 34个 (部分仅输入) |
+| USB | 需外部 USB-TTL (CP2102等) |
+| 工作电压 | 3.3V |
+| WiFi | 802.11 b/g/n |
+| Bluetooth | BT 4.2 + BLE |
+
+### 传动系统
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| 同步带 | 2GT | 节距 2mm |
+| 惰轮 | 20齿 | 内孔3mm, 带宽6mm |
+| 每圈位移 | 40mm | 20齿 × 2mm |
+| 微步设置 | 1/16 | 3200微步/圈 |
+| 分辨率 | 0.0125mm/步 | 高精度定位 |
+
+### 接线图
 
 ```
-ESP32-C3 SuperMini          INA226 / OLED
-     GPIO4  ────────────────  SDA
-     GPIO5  ────────────────  SCL
-     3.3V   ────────────────  VCC
-     GND    ────────────────  GND
+ESP32-WROOM-32E (DevKit) 引脚分布:
+                    ┌─────────────────┐
+                    │      USB        │
+                    │   ┌───────┐     │
+              3V3 ──┤   │       │     ├── VIN (5V)
+              GND ──┤   │ESP32  │     ├── GND
+            GPIO15──┤   │WROOM  │     ├── GPIO13
+             GPIO2──┤   │  32E  │     ├── GPIO12
+             GPIO4──┤   │       │     ├── GPIO14
+            GPIO16──┤   │       │     ├── GPIO27 (EN)
+            GPIO17──┤   │       │     ├── GPIO26 (DIR)
+             GPIO5──┤   │       │     ├── GPIO25 (STEP)
+ (BTN_ENTER)GPIO18─┤   │       │     ├── GPIO33 (BTN_DOWN)
+ (BTN_BACK) GPIO19─┤   │       │     ├── GPIO32 (BTN_UP)
+       (SDA)GPIO21─┤   └───────┘     ├── GPIO35
+       (SCL)GPIO22─┤                 ├── GPIO34
+            GPIO23──┤                 ├── VN (GPIO39)
+              GND ──┤                 ├── VP (GPIO36)
+                    │      RST  EN    │
+                    └─────────────────┘
 ```
 
-> ⚠️ **注意**: GPIO8 是板载 LED，请勿用于 I2C！
+```
+ESP32-WROOM-32E            DRV8825
+    GPIO25 ──────────────>  STEP
+    GPIO26 ──────────────>  DIR
+    GPIO27 ──────────────>  EN (ENABLE)
+    
+    M0/M1/M2 不由MCU控制！请用跳线帽设置微步:
+    - 全步: M0=GND, M1=GND, M2=GND (或全部悬空)
+    - 1/16: M0=GND, M1=GND, M2=VCC
+    
+ESP32-WROOM-32E            OLED (I2C)
+    GPIO21 ──────────────>  SDA
+    GPIO22 ──────────────>  SCL
+    3.3V   ──────────────>  VCC
+    GND    ──────────────>  GND
+    
+ESP32-WROOM-32E            按键 (active LOW, 按下接GND)
+    GPIO32 ──────────────>  UP (上/增加)
+    GPIO33 ──────────────>  DOWN (下/减少)
+    GPIO18 ──────────────>  ENTER (确认/暂停)
+    GPIO19 ──────────────>  BACK (返回/停止)
+    
+DRV8825 电源
+    VMOT   ──────────────>  12V DC (+)
+    GND    ──────────────>  12V DC (-)
+    
+⚠️ 重要注意事项: 
+1. DRV8825 的 RESET 和 SLEEP 引脚必须短接!
+2. VMOT 旁边必须接 100μF 电解电容
+3. ESP32 的 GND 必须与 DRV8825 的 GND 连接 (共地)
+4. 按键使用内部上拉，按下接GND
+5. M0/M1/M2 由跳线帽设置，不要连接到 ESP32 GPIO
+```
 
-## 软件配置
+### DRV8825 微步设置 (用跳线帽)
 
-### PlatformIO 环境
+| M0 | M1 | M2 | 细分 |
+|----|----|----|------|
+| L  | L  | L  | 全步 (悬空也可) |
+| H  | L  | L  | 1/2 |
+| L  | H  | L  | 1/4 |
+| H  | H  | L  | 1/8 |
+| L  | L  | H  | 1/16 ✓ (推荐) |
+| H  | L  | H  | 1/32 |
 
-- Platform: espressif32
-- Board: esp32-c3-devkitm-1
-- Framework: Arduino
+> **注意**: 修改微步后需要同步修改代码中的 `MICROSTEP_DIV` 常量
+
+## 使用说明
+
+### 菜单操作
+
+1. **主菜单**: 使用 UP/DOWN 选择项目，ENTER 进入
+2. **参数设置**: UP/DOWN 调整数值，ENTER 确认，BACK 返回
+3. **运行中**: ENTER 暂停/继续，BACK 停止
+
+### 主菜单项目
+
+```
+┌─────────────────────────┐
+│   MOTOR CONTROLLER      │
+├─────────────────────────┤
+│ > Speed Setting    50   │
+│   Distance Set    100   │
+│   Time Setting     10   │
+│   Accel Time      500   │
+│   Direction       FWD   │
+│   Motion Mode     CON   │
+│   >> START <<           │
+└─────────────────────────┘
+```
+
+### 运动模式说明e e e e
+
+#### 连续模式 (Continuous)
+- 按设定时间运行
+- 完整的 S 型加速-匀速-减速曲线
+- 适合: 测试、展示、定时运行
+
+#### 定距模式 (Distance)
+- 运动到设定距离后停止
+- 自动减速到达目标位置
+- 适合: 精确定位、点对点移动
+
+#### 往复模式 (Reciprocate)
+- 在设定距离内往复运动
+- 运行直到达到设定时间
+- 适合: 往复式加工、测试
+
+### S型加速曲线
+
+采用正弦函数实现平滑加速，避免步进电机失步:
+
+```
+加速阶段: v(t) = Vmax × (1 - cos(π × t / T)) / 2
+减速阶段: v(t) = Vmax × (1 + cos(π × t / T)) / 2
+```
+
+其中:
+- `Vmax`: 目标速度 (mm/s)
+- `T`: 加速时间 (ms)
+- `t`: 当前时间 (ms)
+
+**S曲线特点:**
+- 加速度从0开始，平滑增加
+- 中间达到最大加速度
+- 到达目标速度时加速度回到0
+- 减小机械冲击，提高定位精度
+
+## 编译上传
+
+### 环境要求
+
+- [PlatformIO IDE](https://platformio.org/)
+- ESP32 平台支持
 
 ### 依赖库
 
-- `robtillaart/INA226`
-- `adafruit/Adafruit SSD1306`
-- `adafruit/Adafruit GFX Library`
+```ini
+lib_deps = 
+    adafruit/Adafruit SSD1306@^2.5.7
+    adafruit/Adafruit GFX Library@^1.11.9
+```
 
-### 编译上传
+### 编译命令
 
 ```bash
 # 编译
 pio run
 
 # 上传
-pio run --target upload
+pio run -t upload
+
+# 监控串口
+pio device monitor
 ```
 
-## 校准参数
+## 参数范围
 
-在 `src/main.cpp` 中调整：
+| 参数 | 最小值 | 最大值 | 默认值 | 增量 | 单位 |
+|------|--------|--------|--------|------|------|
+| 速度 | 1 | 200 | 50 | ±5 | mm/s |
+| 距离 | 1 | 400 | 100 | ±10 | mm |
+| 时间 | 1 | 3600 | 10 | ±1 | s |
+| 加速时间 | 100 | 2000 | 500 | ±50 | ms |
 
-```cpp
-#define VOLTAGE_CALIBRATION 0.944   // 电压校准系数
-#define CURRENT_CALIBRATION 1.0     // 电流校准系数
+## 性能计算
+
+### 理论最大速度
+
+```
+最大步频 = 40,000 Hz (软件限制)
+每步距离 = 0.0125 mm
+理论最大速度 = 40000 × 0.0125 = 500 mm/s
+
+实际设置最大 200 mm/s (考虑电机扭矩下降)
 ```
 
-**校准方法**: 用万用表测量实际电压，计算 `实际电压 / 显示电压` 得到校准系数。
+### 定位精度
 
-## Megatec Q1 协议
+```
+微步分辨率 = 1/16
+每圈步数 = 200 × 16 = 3200 步
+每圈位移 = 40 mm
+分辨率 = 40 / 3200 = 0.0125 mm = 12.5 μm
+```
 
-### 支持的命令
+## 串口调试输出
 
-| 命令 | 响应格式 | 说明 |
-|------|----------|------|
-| `Q1\r` | `(MMM.M NNN.N PPP.P QQQ RR.R S.S TT.T b7b6b5b4b3b2b1b0\r` | 状态查询 |
-| `I\r` | `#Simulated_UPS_ESP32C3\r` | 型号查询 |
-| `F\r` | `#220.0 005 012.0 50.0\r` | 额定值查询 |
+```
+========================================
+  ESP32-WROOM-32E Stepper Controller
+  S-Curve Acceleration System
+========================================
+System Configuration:
+  Motor: 17HS3401S (200 steps/rev)
+  Microstep: 1/16
+  Belt: 2GT 20 teeth pulley
+  Resolution: 0.0125 mm/step
+  Max Travel: 400.00 mm
+  Speed Range: 1 - 200 mm/s
+----------------------------------------
+Starting motion...
+  Target Speed: 50.00 mm/s
+  Accel Time: 500 ms
+  Mode: Continuous
+  Direction: Forward
+Motor ENABLED
+Motion task created!
+Accel time: 500 ms
+Motion task completed!
+Total distance: 245.75 mm
+Total time: 10.02 s
+Motion stopped!
+```
 
-### Q1 响应字段
+## 安全注意事项
 
-| 字段 | 说明 | 数据来源 |
-|------|------|----------|
-| MMM.M | 输入电压 (V) | 电压 > 11V 显示 220.0，否则 000.0 |
-| NNN.N | 故障电压 (V) | 同输入电压 |
-| PPP.P | 输出电压 (V) | INA226 实测电压 |
-| QQQ | 负载 (%) | (功率 / 15W) × 100 |
-| RR.R | 频率 (Hz) | 固定 50.0 |
-| S.S | 电池电压 (V) | INA226 实测电压 |
-| TT.T | 温度 (°C) | ESP32-C3 内部温度 |
-| b7-b0 | 状态位 | 见下表 |
+⚠️ **警告**:
 
-### 状态位定义
+1. **机械安全**: 运行前确保传动系统无障碍物
+2. **行程限制**: 不要超过最大行程 (400mm)
+3. **运行干预**: 电机运行时避免手动干预皮带/惰轮
+4. **首次测试**: 首次使用请低速测试
+5. **电源安全**: 确保12V电源极性正确
+6. **散热**: 长时间运行注意DRV8825散热
 
-| 位 | 含义 | 触发条件 |
-|----|------|----------|
-| b7 | 电池供电 | 电压 < 11.8V |
-| b6 | 电量低 | 电压 < 10.8V（触发关机） |
-| b5 | 旁路激活 | 固定 0 |
-| b4 | UPS 故障 | 固定 0 |
-| b3 | UPS 类型 | 固定 1（待机式） |
-| b2 | 测试中 | 固定 0 |
-| b1 | 关机激活 | 固定 0 |
-| b0 | 蜂鸣器静音 | 固定 0 |
+## 故障排除
 
-## 飞牛 NAS / Linux NUT 配置
+| 问题 | 可能原因 | 解决方法 |
+|------|----------|----------|
+| 电机不转 | EN未使能 | 检查GPIO27连接 |
+| 电机振动不转 | 接线顺序错误 | 检查电机4线连接 |
+| 失步 | 速度过快 | 降低速度或增加加速时间 |
+| OLED不显示 | I2C地址错误 | 确认地址0x3C |
 
-### 1. 安装 NUT
+## 扩展功能 (TODO)
+
+- [ ] 限位开关支持
+- [ ] 自动归零/回原点功能
+- [ ] 速度曲线预设保存
+- [ ] WiFi/蓝牙远程控制
+- [ ] 参数 EEPROM/NVS 保存
+- [ ] 中文界面支持
+- [ ] 多段运动编程
+
+## 项目结构
+
+```
+ESP32-WROOM-32E-Stepper/
+├── platformio.ini          # PlatformIO配置
+├── README.md               # 项目说明
+├── include/
+│   └── chinese_font.h      # 中文字库 (备用)
+└── src/
+    └── main.cpp            # 主程序
+```
+
+## 上传说明
+
+ESP32-WROOM-32E 开发板通常已集成 USB-TTL 芯片 (如 CP2102/CH340)，可直接上传：
 
 ```bash
-# Debian/Ubuntu
-sudo apt install nut
+# 编译上传
+pio run -t upload
 
-# 飞牛 NAS 通常已预装
+# 监控串口
+pio device monitor -b 115200
 ```
 
-### 2. 配置 UPS (`/etc/nut/ups.conf`)
-
-```ini
-[myups]
-    driver = blazer_ser
-    port = /dev/ttyACM0
-    desc = "ESP32-C3 Simulated UPS"
-```
-
-### 3. 配置访问权限 (`/etc/nut/upsd.users`)
-
-```ini
-[admin]
-    password = secret
-    actions = SET
-    instcmds = ALL
-
-[upsmon]
-    password = secret
-    upsmon master
-```
-
-### 4. 配置监控 (`/etc/nut/upsmon.conf`)
-
-```ini
-MONITOR myups@localhost 1 upsmon secret master
-SHUTDOWNCMD "/sbin/shutdown -h +0"
-```
-
-### 5. 启动服务
-
-```bash
-sudo systemctl restart nut-server
-sudo systemctl restart nut-monitor
-```
-
-### 6. 验证连接
-
-```bash
-# 查看 UPS 状态
-upsc myups
-
-# 应显示类似：
-# battery.voltage: 12.56
-# input.voltage: 220.0
-# ups.status: OL
-```
-
-## 状态指示
-
-### OLED 显示
-
-```
-== UPS Simulator ==
-─────────────────────
-Volt: 12.56 V
-Curr: 150.0 mA
-Powr: 1.88 W
-─────────────────────
-AC MODE
-```
-
-### 状态模式
-
-| 显示 | 含义 | 条件 |
-|------|------|------|
-| `AC MODE` | 市电在线 | 电压 ≥ 11.8V |
-| `BAT MODE` | 电池供电 | 电压 < 11.8V |
-| `LOW BATT!` | 电量低 | 电压 < 10.8V |
-
-## 阈值配置
-
-```cpp
-#define AC_ONLINE_THRESHOLD   11.8   // 市电在线阈值 (V)
-#define LOW_BATTERY_THRESHOLD 10.8   // 低电量阈值 (V)
-#define MAINS_OK_THRESHOLD    11.0   // 市电恢复阈值 (V)
-#define SIMULATED_MAX_POWER   15.0   // 模拟最大功率 (W)
-```
-
-## 串口配置
-
-- **波特率**: 115200 (USB 虚拟串口)
-- **数据位**: 8
-- **停止位**: 1
-- **校验位**: 无
-
-> 💡 传统 RS232 UPS 通常使用 2400 波特率，但 USB CDC 无此限制。
+如遇上传问题，可尝试：
+1. 按住 **BOOT** 按钮
+2. 按一下 **EN/RST** 按钮
+3. 松开 **BOOT** 按钮
+4. 执行上传命令
 
 ## 许可证
 
 MIT License
 
-## 参考资料
+## 更新日志
 
-- [Megatec Protocol Documentation](http://networkupstools.org/protocols/megatec.html)
-- [Network UPS Tools (NUT)](https://networkupstools.org/)
-- [INA226 Datasheet](https://www.ti.com/product/INA226)
-- [ESP32-C3 Technical Reference](https://www.espressif.com/sites/default/files/documentation/esp32-c3_technical_reference_manual_en.pdf)
+### v1.0.0 (2026-01-19)
+- 初始版本 (ESP32-C3)
+
+### v1.1.0 (2026-01-19)
+- 迁移至 ESP32-S2 Mini
+- 优化引脚分配
+- 更新 I2C 默认引脚
+
+### v1.2.0 (2026-01-19)
+- 迁移至 ESP32-WROOM-32E
+- 双核处理器，更稳定
+- 使用标准 USB-TTL 上传
+- 新引脚分配:
+  - STEP=GPIO25, DIR=GPIO26, EN=GPIO27
+  - M0=GPIO14, M1=GPIO12, M2=GPIO13
+  - I2C: SDA=GPIO21, SCL=GPIO22
+  - 按键: UP=GPIO32, DOWN=GPIO33, ENTER=GPIO18, BACK=GPIO19
+
+---
+
+作者: GitHub Copilot  
+日期: 2026-01-19
