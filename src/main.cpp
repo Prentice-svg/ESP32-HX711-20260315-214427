@@ -6,7 +6,7 @@
  * - MCU: ESP32-WROOM-32E (双核 Xtensa LX6 @ 240MHz)
  * - 驱动: DRV8825 步进电机驱动模块
  * - 电机: 17HS3401S (1.8°步距角, 200步/圈)
- * - 传动: 2GT同步带 20齿惰轮
+ * - 传动: 绕线轴 (直径 7mm，线绕在轴上拉动物体)
  * - 力传感器: HX711 + 称重传感器
  * 
  * 接线 (ESP32-WROOM-32E):
@@ -124,11 +124,19 @@ uint32_t bleStartTime = 0;
 // 当前接法: M0=VCC, M1=悬空(GND), M2=VCC → 1/32 微步 (最平滑)
 #define MICROSTEP_DIV       32      // 当前: 1/32 微步
 
-#define STEPS_PER_REV       200
-#define PULLEY_TEETH        20
-#define BELT_PITCH          2.0     // mm
+#define STEPS_PER_REV       200     // 步进电机每圈步数 (1.8°步距角)
 
-const float STEPS_PER_MM = (float)(STEPS_PER_REV * MICROSTEP_DIV) / (PULLEY_TEETH * BELT_PITCH);
+// ==================== 绕线轴传动参数 ====================
+// 线绕在轴上，电机转动时线缠绕/释放，拉动物体
+// 每转一圈，线移动距离 = π × 轴直径
+#define SPOOL_DIAMETER      7.0     // 绕线轴直径 (mm)
+
+// 计算每毫米步数
+// 每圈线位移 = π × D = 3.14159 × 7 = 21.99 mm
+// 每圈总步数 = 200 × 32 = 6400 步
+// STEPS_PER_MM = 6400 / 21.99 ≈ 291.0 步/mm
+const float MM_PER_REV = PI * SPOOL_DIAMETER;   // 每转一圈的线位移 (mm)
+const float STEPS_PER_MM = (float)(STEPS_PER_REV * MICROSTEP_DIV) / MM_PER_REV;
 const float MM_PER_STEP = 1.0 / STEPS_PER_MM;
 
 // ==================== 运动参数 ====================
@@ -139,22 +147,23 @@ uint32_t targetTime = 10;           // 秒
 uint32_t accelTime = 800;           // ms (延长加速时间使启动更平滑)
 bool direction = true;              // true=正向
 
-// 平滑度参数
-const float MIN_START_SPEED = 12.0;  // mm/s 最小起步速度,避免低速抖动区间
+// 平滑度参数 (绕线轴传动速度较慢，降低最小起步速度)
+const float MIN_START_SPEED = 3.0;   // mm/s 最小起步速度,避免低速抖动区间
 
 // ==================== 共振补偿参数 ====================
 // 步进电机在特定频率会共振，通常在 50-200 Hz 和 500-1500 Hz
 // 共振频率 = 速度(mm/s) * STEPS_PER_MM
-// 对于 1/32 微步: STEPS_PER_MM = 80, 所以:
-//   100 Hz 共振 ≈ 1.25 mm/s
-//   800 Hz 共振 ≈ 10 mm/s
-//   1200 Hz 共振 ≈ 15 mm/s
+// 对于 1/32 微步 + 绕线轴(7mm): STEPS_PER_MM ≈ 291, 所以:
+//   100 Hz 共振 ≈ 0.34 mm/s
+//   800 Hz 共振 ≈ 2.75 mm/s
+//   1200 Hz 共振 ≈ 4.12 mm/s
+// 注意: 绕线轴传动比同步带慢约 3.6 倍，共振速度区间也相应降低
 
-// 共振区间 (mm/s) - 根据实际观察调整
-const float RESONANCE_ZONE1_LOW = 8.0;    // 第一共振区下限
-const float RESONANCE_ZONE1_HIGH = 18.0;  // 第一共振区上限
-const float RESONANCE_ZONE2_LOW = 35.0;   // 第二共振区下限
-const float RESONANCE_ZONE2_HIGH = 50.0;  // 第二共振区上限
+// 共振区间 (mm/s) - 根据绕线轴传动调整
+const float RESONANCE_ZONE1_LOW = 2.0;    // 第一共振区下限
+const float RESONANCE_ZONE1_HIGH = 5.0;   // 第一共振区上限
+const float RESONANCE_ZONE2_LOW = 10.0;   // 第二共振区下限
+const float RESONANCE_ZONE2_HIGH = 15.0;  // 第二共振区上限
 
 // 共振区平滑过渡参数
 const float RESONANCE_TRANSITION_WIDTH = 3.0;  // 过渡区宽度（mm/s）
@@ -186,7 +195,7 @@ const char* menuLabels[] = {
     "Phyphox",    // Phyphox 实验模式
     "Tare",       // 力传感器归零
     "Calibrate", // 力传感器校准 (100g砝码)
-    "Unlock",     // 解锁电机
+    "Lock",       // 锁定/解锁电机 (手动控制)
     "START"
 };
 
@@ -298,8 +307,13 @@ void setup() {
     enableMotor(false);
     
     Serial.println("Ready!");
+    Serial.println("\n--- 传动参数 (绕线轴) ---");
+    Serial.print("轴直径 = "); Serial.print(SPOOL_DIAMETER); Serial.println(" mm");
+    Serial.print("每圈线位移 = "); Serial.print(MM_PER_REV, 2); Serial.println(" mm");
+    Serial.print("微步细分 = 1/"); Serial.println(MICROSTEP_DIV);
+    Serial.print("STEPS_PER_MM = "); Serial.println(STEPS_PER_MM, 2);
     Serial.print("MM_PER_STEP = "); Serial.println(MM_PER_STEP, 6);
-    Serial.print("Microstep = 1/"); Serial.println(MICROSTEP_DIV);
+    Serial.print("每圈总步数 = "); Serial.println(STEPS_PER_REV * MICROSTEP_DIV);
     
     // 初始化完成后立即显示主菜单
     delay(500);
@@ -624,10 +638,12 @@ void stopPhyphoxMode() {
     Serial.println(">>> PHYPHOX MODE STOP <<<");
     phyphoxMode = false;
     isRunning = false;
+    currentSpeed = 0;
+    stepInterval = 100000;
     
-    // 锁定电机
-    enableMotor(true);
-    motorLocked = true;
+    // 停止后保持解锁状态（用户可手动锁定）
+    enableMotor(false);
+    motorLocked = false;
     
     currentMenu = MENU_COMPLETED;
 }
@@ -799,6 +815,11 @@ float calculateResonanceCompensation(float speed, float targetSpeed) {
 }
 
 float sCurveSpeed(uint32_t elapsedMs, uint32_t accelMs, uint32_t totalMs, float maxSpeed) {
+    // 运行时间已超过总时间，停止
+    if (elapsedMs >= totalMs) {
+        return 0;
+    }
+    
     // 计算速度范围 (从最小起步速度到最大速度)
     float speedRange = maxSpeed - MIN_START_SPEED;
     float baseSpeed;
@@ -826,14 +847,17 @@ float sCurveSpeed(uint32_t elapsedMs, uint32_t accelMs, uint32_t totalMs, float 
         isInAcceleration = true;
     } else if (elapsedMs > totalMs - accelMs) {
         // ========== 减速阶段 ==========
+        // t 从 1 减到 0，当 elapsedMs = totalMs 时 t = 0
         float t = (float)(totalMs - elapsedMs) / accelMs;
+        if (t < 0) t = 0;  // 确保不为负数
         float smooth = smoothStep7thOrder(t);
-        baseSpeed = MIN_START_SPEED + speedRange * smooth;
+        // 减速时：速度从 maxSpeed 平滑减到 0 (不是 MIN_START_SPEED)
+        baseSpeed = maxSpeed * smooth;
 
         // 减速阶段同样应用共振区补偿，确保平滑通过
         float compensation = calculateResonanceCompensation(baseSpeed, maxSpeed);
-        if (compensation > 1.01f) {
-            float speedBoost = (baseSpeed - MIN_START_SPEED) * (compensation - 1.0f) * 0.3f;
+        if (compensation > 1.01f && baseSpeed > MIN_START_SPEED) {
+            float speedBoost = baseSpeed * (compensation - 1.0f) * 0.3f;
             baseSpeed += speedBoost;
         }
 
@@ -844,8 +868,12 @@ float sCurveSpeed(uint32_t elapsedMs, uint32_t accelMs, uint32_t totalMs, float 
         isInAcceleration = false;
     }
 
-    // 限制在合理范围内
-    baseSpeed = constrain(baseSpeed, MIN_START_SPEED, maxSpeed);
+    // 限制在合理范围内 (减速时允许减到0)
+    if (elapsedMs > totalMs - accelMs) {
+        baseSpeed = constrain(baseSpeed, 0, maxSpeed);
+    } else {
+        baseSpeed = constrain(baseSpeed, MIN_START_SPEED, maxSpeed);
+    }
 
     return baseSpeed;
 }
@@ -883,11 +911,13 @@ void stopMotion() {
     Serial.println(">>> STOP MOTION <<<");
     isRunning = false;
     isPaused = false;
+    currentSpeed = 0;
+    stepInterval = 100000;  // 停止脉冲输出
     
-    // 运行结束后锁定电机（保持使能，防止滑动）
-    enableMotor(true);
-    motorLocked = true;
-    Serial.println("Motor LOCKED (holding position)");
+    // 运行结束后保持解锁状态（用户可手动锁定）
+    enableMotor(false);
+    motorLocked = false;
+    Serial.println("Motion stopped (motor unlocked)");
     
     currentMenu = MENU_COMPLETED;
     
@@ -943,7 +973,10 @@ void updateResonanceScan() {
         if (scanSpeed >= SCAN_MAX_SPEED) {
             Serial.println(">>> RESONANCE SCAN COMPLETE <<<");
             resonanceScanMode = false;
+            currentSpeed = 0;
+            stepInterval = 100000;
             enableMotor(false);
+            motorLocked = false;
             currentMenu = MENU_COMPLETED;
         }
     }
@@ -1081,7 +1114,7 @@ void processButtons() {
     
     if (enter) {
         switch (menuIndex) {
-            case 0: targetSpeed = constrain(targetSpeed + 5, 1, 200); break;
+            case 0: targetSpeed = constrain(targetSpeed + 1, 1, 200); break;
             case 1: targetDistance = constrain(targetDistance + 10, 1, 400); break;
             case 2: targetTime = constrain(targetTime + 1, 1, 3600); break;
             case 3: accelTime = constrain(accelTime + 50, 100, 2000); break;
@@ -1091,11 +1124,15 @@ void processButtons() {
             case 7: startPhyphoxMode(); break;    // Phyphox 实验模式
             case 8: tareForce(); break;           // 力传感器归零
             case 9: startCalibration(); break;    // 力传感器校准
-            case 10:  // 解锁电机
+            case 10:  // 锁定/解锁电机 (手动控制)
                 if (motorLocked) {
                     enableMotor(false);
                     motorLocked = false;
                     Serial.println("Motor UNLOCKED");
+                } else {
+                    enableMotor(true);
+                    motorLocked = true;
+                    Serial.println("Motor LOCKED");
                 }
                 break;
             case 11: startMotion(); break;        // START
@@ -1104,7 +1141,7 @@ void processButtons() {
     
     if (back) {
         switch (menuIndex) {
-            case 0: targetSpeed = constrain(targetSpeed - 5, 1, 200); break;
+            case 0: targetSpeed = constrain(targetSpeed - 1, 1, 200); break;
             case 1: targetDistance = constrain(targetDistance - 10, 1, 400); break;
             case 2: targetTime = constrain(targetTime - 1, 1, 3600); break;
             case 3: accelTime = constrain(accelTime - 50, 100, 2000); break;
