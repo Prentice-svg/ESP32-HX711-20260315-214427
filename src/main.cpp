@@ -175,14 +175,34 @@ const float RESONANCE_ACCEL_BOOST = 1.3;  // 共振区加速倍率 - 温和通�
 enum MotionMode { MODE_CONTINUOUS, MODE_DISTANCE, MODE_RECIPROCATE, MODE_RESONANCE_SCAN };
 MotionMode motionMode = MODE_CONTINUOUS;
 
-// ==================== 菜单系统 ====================
+// ==================== 菜单系统 (WouoUI 风格丝滑动画) ====================
 
 enum MenuState { MENU_MAIN, MENU_RUNNING, MENU_COMPLETED, MENU_CALIBRATE };
 MenuState currentMenu = MENU_MAIN;
 int menuIndex = 0;
-const int MENU_ITEMS = 12;  // 增加校准选项
-int menuScrollOffset = 0;   // 菜单滚动偏移
-const int VISIBLE_ITEMS = 7;  // 屏幕可见菜单项数
+const int MENU_ITEMS = 12;
+
+// WouoUI 风格动画参数
+#define LIST_FONT_H     8       // 字体高度
+#define LIST_LINE_H     10      // 每行高度（含间距）
+#define LIST_TEXT_S     2       // 文字左边距
+#define LIST_BAR_W      3       // 右侧滚动条宽度
+#define LIST_BOX_R      1       // 选择框圆角半径
+#define UI_DEPTH        5       // 最大菜单深度
+#define UI_ANI_SPEED    50      // 动画速度 (越大越慢, 10-100)
+
+// 动画状态变量
+struct {
+    float y;                    // 列表Y偏移 (动画用)
+    float y_trg;                // 列表Y偏移目标
+    float box_y;                // 选择框Y位置 (动画用)
+    float box_y_trg;            // 选择框Y目标位置
+    float box_w;                // 选择框宽度 (动画用)
+    float box_w_trg;            // 选择框宽度目标
+    float bar_y;                // 滚动条位置 (动画用)
+    float bar_y_trg;            // 滚动条目标位置
+    bool init;                  // 是否完成初始化动画
+} uiList = {0, 0, 0, 0, 0, 0, 0, 0, false};
 
 const char* menuLabels[] = {
     "Speed",
@@ -228,7 +248,7 @@ uint32_t lastScanStepTime = 0;
 // 按键
 unsigned long lastButtonTime = 0;
 unsigned long lastDisplayTime = 0;
-const unsigned long DISPLAY_INTERVAL = 100;  // OLED更新间隔100ms
+const unsigned long DISPLAY_INTERVAL = 33;   // OLED更新间隔33ms (~30fps，动画更流畅)
 unsigned long lastBLETime = 0;
 const unsigned long BLE_INTERVAL = 50;       // BLE数据发送间隔50ms (20Hz)
 
@@ -268,6 +288,9 @@ void stopPhyphoxMode();
 void updatePhyphox();
 void sendBLEData();
 void readForce();
+void uiAnimation(float *val, float *target, float speed);
+void uiMenuInit();
+void uiMenuAnimUpdate();
 void tareForce();
 void saveCalibration();
 bool loadCalibration();
@@ -315,11 +338,14 @@ void setup() {
     Serial.print("MM_PER_STEP = "); Serial.println(MM_PER_STEP, 6);
     Serial.print("每圈总步数 = "); Serial.println(STEPS_PER_REV * MICROSTEP_DIV);
     
+    // 初始化 WouoUI 动画系统
+    uiMenuInit();
+    
     // 初始化完成后立即显示主菜单
     delay(500);
     lastDisplayTime = 0;  // 强制立即更新显示
     updateDisplay();
-    Serial.println("Menu displayed!");
+    Serial.println("WouoUI Menu Ready!");
 }
 
 void loop() {
@@ -1090,26 +1116,14 @@ void processButtons() {
         return;
     }
     
-    // 主菜单
+    // 主菜单 (WouoUI 风格循环滚动)
     if (up) {
         menuIndex = (menuIndex - 1 + MENU_ITEMS) % MENU_ITEMS;
-        // 更新滚动偏移
-        if (menuIndex < menuScrollOffset) {
-            menuScrollOffset = menuIndex;
-        }
-        if (menuIndex >= menuScrollOffset + VISIBLE_ITEMS) {
-            menuScrollOffset = menuIndex - VISIBLE_ITEMS + 1;
-        }
+        // 动画系统会自动处理滚动
     }
     if (down) {
         menuIndex = (menuIndex + 1) % MENU_ITEMS;
-        // 更新滚动偏移
-        if (menuIndex < menuScrollOffset) {
-            menuScrollOffset = menuIndex;
-        }
-        if (menuIndex >= menuScrollOffset + VISIBLE_ITEMS) {
-            menuScrollOffset = menuIndex - VISIBLE_ITEMS + 1;
-        }
+        // 动画系统会自动处理滚动
     }
     
     if (enter) {
@@ -1151,6 +1165,58 @@ void processButtons() {
     }
 }
 
+// ==================== WouoUI 丝滑动画系统 ====================
+
+// 核心动画函数 (WouoUI 风格非线性缓动)
+// 只需两行实现平滑动画，可被打断并自然过渡
+void uiAnimation(float *val, float *target, float speed) {
+    if (*val != *target) {
+        if (fabs(*val - *target) < 0.5f) *val = *target;
+        else *val += (*target - *val) / (speed / 10.0f);
+    }
+}
+
+// 菜单初始化动画
+void uiMenuInit() {
+    uiList.y = 0;
+    uiList.y_trg = LIST_LINE_H;
+    uiList.box_y = 0;
+    uiList.box_y_trg = 0;
+    uiList.box_w = 0;
+    uiList.box_w_trg = 60;
+    uiList.bar_y = 0;
+    uiList.bar_y_trg = 0;
+    uiList.init = false;
+}
+
+// 更新菜单动画目标值
+void uiMenuAnimUpdate() {
+    // 计算选择框目标位置 (相对于显示区域)
+    int visibleLines = (SCREEN_HEIGHT - 10) / LIST_LINE_H;  // 可见行数 (减去标题栏)
+    int halfVisible = visibleLines / 2;
+    
+    // 计算列表偏移目标
+    if (menuIndex < halfVisible) {
+        uiList.y_trg = 0;
+    } else if (menuIndex > MENU_ITEMS - 1 - halfVisible) {
+        uiList.y_trg = -((MENU_ITEMS - visibleLines) * LIST_LINE_H);
+    } else {
+        uiList.y_trg = -((menuIndex - halfVisible) * LIST_LINE_H);
+    }
+    
+    // 选择框Y位置目标 (在屏幕上的绝对位置)
+    uiList.box_y_trg = 10 + (menuIndex * LIST_LINE_H) + uiList.y_trg;
+    
+    // 滚动条位置目标
+    if (MENU_ITEMS > 1) {
+        uiList.bar_y_trg = (float)menuIndex / (MENU_ITEMS - 1) * (SCREEN_HEIGHT - 20);
+    }
+    
+    // 选择框宽度目标 (根据当前菜单项文字长度)
+    // 简化: 使用固定宽度或根据菜单项动态调整
+    uiList.box_w_trg = 120;  // 几乎全宽
+}
+
 // ==================== 显示更新 ====================
 
 void updateDisplay() {
@@ -1186,61 +1252,86 @@ void updateDisplay() {
 }
 
 void drawMainMenu() {
+    // ===== WouoUI 风格丝滑动画菜单 =====
+    
+    // 1. 更新动画目标值
+    uiMenuAnimUpdate();
+    
+    // 2. 计算动画过渡值 (非线性缓动)
+    uiAnimation(&uiList.y, &uiList.y_trg, UI_ANI_SPEED);
+    uiAnimation(&uiList.box_y, &uiList.box_y_trg, UI_ANI_SPEED);
+    uiAnimation(&uiList.box_w, &uiList.box_w_trg, UI_ANI_SPEED);
+    uiAnimation(&uiList.bar_y, &uiList.bar_y_trg, UI_ANI_SPEED);
+    
+    // 3. 绘制标题栏
     display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);  // 确保先设置正确的颜色
-    display.setCursor(0, 0);
-    
-    // 标题栏显示锁定状态
-    if (motorLocked) {
-        display.println(F("== CTRL [LOCKED] =="));
-    } else {
-        display.println(F("== STEPPER CTRL =="));
-    }
-    
-    // 只显示可见的菜单项（支持滚动）
-    for (int v = 0; v < VISIBLE_ITEMS && (menuScrollOffset + v) < MENU_ITEMS; v++) {
-        int i = menuScrollOffset + v;
-        display.setCursor(0, 9 + v * 8);
-        
-        if (i == menuIndex) {
-            display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);  // 选中项：反色显示
-        } else {
-            display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);  // 非选中项：正常显示（指定背景色）
-        }
-        
-        // 显示菜单项和值
-        char buf[22];
-        switch (i) {
-            case 0: snprintf(buf, sizeof(buf), " Speed:   %3d mm/s", (int)targetSpeed); break;
-            case 1: snprintf(buf, sizeof(buf), " Distance:%3d mm", (int)targetDistance); break;
-            case 2: snprintf(buf, sizeof(buf), " Time:    %3d s", (int)targetTime); break;
-            case 3: snprintf(buf, sizeof(buf), " Accel:   %4d ms", (int)accelTime); break;
-            case 4: snprintf(buf, sizeof(buf), " Dir: %s", direction ? "FWD" : "REV"); break;
-            case 5: 
-                snprintf(buf, sizeof(buf), " Mode:%s", 
-                    motionMode == MODE_CONTINUOUS ? "Cont" :
-                    motionMode == MODE_DISTANCE ? "Dist" : "Recip");
-                break;
-            case 6: snprintf(buf, sizeof(buf), " >> ResoScan <<"); break;
-            case 7: snprintf(buf, sizeof(buf), " >> Phyphox <<"); break;
-            case 8: snprintf(buf, sizeof(buf), " [Tare] %.3fN", forceReading); break;
-            case 9: snprintf(buf, sizeof(buf), " [Calib] 100g"); break;
-            case 10: snprintf(buf, sizeof(buf), " [%s]", motorLocked ? "Unlock" : "Unlocked"); break;
-            case 11: snprintf(buf, sizeof(buf), " >>> START <<<"); break;
-        }
-        display.print(buf);
-    }
-    
-    // 显示滚动指示器
     display.setTextColor(SSD1306_WHITE);
-    if (menuScrollOffset > 0) {
-        display.setCursor(120, 9);
-        display.print(F("^"));
+    display.fillRect(0, 0, SCREEN_WIDTH, 9, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(2, 1);
+    if (motorLocked) {
+        display.print(F("STEPPER [LOCKED]"));
+    } else {
+        display.print(F("STEPPER CONTROL"));
     }
-    if (menuScrollOffset + VISIBLE_ITEMS < MENU_ITEMS) {
-        display.setCursor(120, 55);
-        display.print(F("v"));
+    
+    // 4. 绘制列表内容 (带平滑滚动)
+    display.setTextColor(SSD1306_WHITE);
+    for (int i = 0; i < MENU_ITEMS; i++) {
+        // 计算每行在屏幕上的Y位置 (包含滚动偏移)
+        int lineY = 10 + i * LIST_LINE_H + (int)uiList.y;
+        
+        // 只绘制可见区域内的项目
+        if (lineY >= 0 && lineY < SCREEN_HEIGHT) {
+            display.setCursor(LIST_TEXT_S + 2, lineY + 1);
+            
+            // 构建菜单文本
+            char buf[22];
+            switch (i) {
+                case 0: snprintf(buf, sizeof(buf), "Speed:  %3d mm/s", (int)targetSpeed); break;
+                case 1: snprintf(buf, sizeof(buf), "Dist:   %3d mm", (int)targetDistance); break;
+                case 2: snprintf(buf, sizeof(buf), "Time:   %3d s", (int)targetTime); break;
+                case 3: snprintf(buf, sizeof(buf), "Accel:  %4d ms", (int)accelTime); break;
+                case 4: snprintf(buf, sizeof(buf), "Dir:    %s", direction ? "FWD >>" : "<< REV"); break;
+                case 5: 
+                    snprintf(buf, sizeof(buf), "Mode:   %s", 
+                        motionMode == MODE_CONTINUOUS ? "Cont" :
+                        motionMode == MODE_DISTANCE ? "Dist" : "Recip");
+                    break;
+                case 6: snprintf(buf, sizeof(buf), ">> ResoScan"); break;
+                case 7: snprintf(buf, sizeof(buf), ">> Phyphox"); break;
+                case 8: snprintf(buf, sizeof(buf), "Tare    %.2fN", forceReading); break;
+                case 9: snprintf(buf, sizeof(buf), "Calibrate 100g"); break;
+                case 10: snprintf(buf, sizeof(buf), "%s Motor", motorLocked ? "Unlock" : "Lock"); break;
+                case 11: snprintf(buf, sizeof(buf), ">>> START <<<"); break;
+            }
+            display.print(buf);
+        }
     }
+    
+    // 5. 绘制选择框 (反色圆角矩形，带平滑宽度和位置动画)
+    int boxY = (int)uiList.box_y;
+    int boxW = (int)uiList.box_w;
+    if (boxY >= 9 && boxY < SCREEN_HEIGHT - 2) {
+        // 使用 XOR 模式绘制选择框 (反色效果)
+        for (int y = boxY; y < boxY + LIST_LINE_H && y < SCREEN_HEIGHT; y++) {
+            for (int x = 0; x < boxW && x < SCREEN_WIDTH - LIST_BAR_W - 1; x++) {
+                // 反转像素
+                if (display.getPixel(x, y)) {
+                    display.drawPixel(x, y, SSD1306_BLACK);
+                } else {
+                    display.drawPixel(x, y, SSD1306_WHITE);
+                }
+            }
+        }
+    }
+    
+    // 6. 绘制右侧滚动条 (带平滑位置动画)
+    int barH = max(4, (int)(SCREEN_HEIGHT - 12) / MENU_ITEMS);  // 滚动条高度
+    int barY = 10 + (int)uiList.bar_y;
+    display.fillRect(SCREEN_WIDTH - LIST_BAR_W, 10, LIST_BAR_W, SCREEN_HEIGHT - 10, SSD1306_BLACK);
+    display.drawRect(SCREEN_WIDTH - LIST_BAR_W, 10, LIST_BAR_W, SCREEN_HEIGHT - 10, SSD1306_WHITE);
+    display.fillRect(SCREEN_WIDTH - LIST_BAR_W + 1, barY, LIST_BAR_W - 2, barH, SSD1306_WHITE);
 }
 
 void drawRunningScreen() {
