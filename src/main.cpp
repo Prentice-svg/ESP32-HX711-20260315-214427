@@ -144,33 +144,36 @@ const float MM_PER_STEP = 1.0 / STEPS_PER_MM;
 float targetSpeed = 50.0;           // mm/s
 float targetDistance = 100.0;       // mm
 uint32_t targetTime = 10;           // 秒
-uint32_t accelTime = 800;           // ms (延长加速时间使启动更平滑)
+uint32_t accelTime = 1500;          // ms (加长加速时间减少震动)
 bool direction = true;              // true=正向
 
-// 平滑度参数 (绕线轴传动速度较慢，降低最小起步速度)
-const float MIN_START_SPEED = 3.0;   // mm/s 最小起步速度,避免低速抖动区间
+// 平滑度参数
+// 绕线轴 STEPS_PER_MM ≈ 291，速度 v mm/s 对应频率 v*291 Hz
+// 低速时频率低，容易震动；需要起步速度足够高以跳过低频共振
+const float MIN_START_SPEED = 5.0;   // mm/s 最小起步速度 (对应 1455 Hz)
 
 // ==================== 共振补偿参数 ====================
 // 步进电机在特定频率会共振，通常在 50-200 Hz 和 500-1500 Hz
 // 共振频率 = 速度(mm/s) * STEPS_PER_MM
 // 对于 1/32 微步 + 绕线轴(7mm): STEPS_PER_MM ≈ 291, 所以:
-//   100 Hz 共振 ≈ 0.34 mm/s
-//   800 Hz 共振 ≈ 2.75 mm/s
-//   1200 Hz 共振 ≈ 4.12 mm/s
-// 注意: 绕线轴传动比同步带慢约 3.6 倍，共振速度区间也相应降低
+//   100 Hz 共振 ≈ 0.34 mm/s (低于起步速度，跳过)
+//   500 Hz 共振 ≈ 1.72 mm/s (低于起步速度，跳过)
+//   800 Hz 共振 ≈ 2.75 mm/s (低于起步速度，跳过)
+//   1200 Hz 共振 ≈ 4.12 mm/s (低于起步速度，跳过)
+//   高频共振一般在1500-3000 Hz ≈ 5.2-10.3 mm/s
 
-// 共振区间 (mm/s) - 根据绕线轴传动调整
-const float RESONANCE_ZONE1_LOW = 2.0;    // 第一共振区下限
-const float RESONANCE_ZONE1_HIGH = 5.0;   // 第一共振区上限
-const float RESONANCE_ZONE2_LOW = 10.0;   // 第二共振区下限
-const float RESONANCE_ZONE2_HIGH = 15.0;  // 第二共振区上限
+// 共振区间 (mm/s) - 根据实际电机特性调整
+const float RESONANCE_ZONE1_LOW = 6.0;    // 第一共振区下限 (~1750 Hz)
+const float RESONANCE_ZONE1_HIGH = 12.0;  // 第一共振区上限 (~3500 Hz)
+const float RESONANCE_ZONE2_LOW = 20.0;   // 第二共振区下限 (~5800 Hz)
+const float RESONANCE_ZONE2_HIGH = 35.0;  // 第二共振区上限 (~10200 Hz)
 
 // 共振区平滑过渡参数
-const float RESONANCE_TRANSITION_WIDTH = 3.0;  // 过渡区宽度（mm/s）
+const float RESONANCE_TRANSITION_WIDTH = 2.0;  // 过渡区宽度（mm/s）
 
 // 补偿强度
-const uint32_t DITHER_AMOUNT = 8;         // 脉冲抖动量 (微秒) - 减小抖动提高平滑度
-const float RESONANCE_ACCEL_BOOST = 1.3;  // 共振区加速倍率 - 温和通过
+const uint32_t DITHER_AMOUNT = 5;         // 脉冲抖动量 (微秒) - 减小抖动量
+const float RESONANCE_ACCEL_BOOST = 1.5;  // 共振区加速倍率 - 快速通过
 
 enum MotionMode { MODE_CONTINUOUS, MODE_DISTANCE, MODE_RECIPROCATE, MODE_RESONANCE_SCAN };
 MotionMode motionMode = MODE_CONTINUOUS;
@@ -788,16 +791,22 @@ float sigmoidTransition(float x, float center, float width) {
     return (sig + 1.0f) * 0.5f;  // 归一化到 0 到 1
 }
 
-// 7次多项式平滑曲线（比5次多项式更平滑，jerk变化更小）
-// 这是最小jerk轨迹的7阶多项式
+// 9次多项式平滑曲线（比7次多项式更平滑，jerk和snap变化更小）
+// 满足边界条件：f(0)=0, f(1)=1, 且一阶、二阶、三阶导数在边界均为0
 float smoothStep7thOrder(float t) {
-    // 7次多项式: -20t^7 + 70t^6 - 84t^5 + 35t^4
-    // 边界条件：f(0)=0, f(1)=1, f'(0)=f'(1)=0, f''(0)=f''(1)=0
-    return t * t * t * t * (t * (t * (t * -20.0f + 70.0f) - 84.0f) + 35.0f);
+    // 使用9次多项式实现最小jerk轨迹
+    // 70t^9 - 315t^8 + 540t^7 - 420t^6 + 126t^5
+    float t2 = t * t;
+    float t4 = t2 * t2;
+    float t5 = t4 * t;
+    return t5 * (126.0f + t * (-420.0f + t * (540.0f + t * (-315.0f + t * 70.0f))));
 }
 
 // 计算共振区平滑补偿系数（返回1.0表示无补偿，>1.0表示加速通过）
 float calculateResonanceCompensation(float speed, float targetSpeed) {
+    // 低于起步速度时不补偿
+    if (speed < MIN_START_SPEED) return 1.0f;
+    
     // 如果不在共振区附近，返回1.0（无补偿）
     if (speed < RESONANCE_ZONE1_LOW - RESONANCE_TRANSITION_WIDTH ||
         (speed > RESONANCE_ZONE1_HIGH + RESONANCE_TRANSITION_WIDTH &&
