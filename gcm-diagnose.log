@@ -1,0 +1,188 @@
+﻿Diagnose log at 2026-03-15T13:42:11Z
+
+AppPath: C:\Program Files\Git\mingw64\bin\git-credential-manager.exe
+InstallDir: C:\Program Files\Git\mingw64\bin\
+Version: 2.6.1+786ab03440ddc82e807a97c0e540f5247e44cec6
+
+------------
+Diagnostic: Environment
+Skipped: False
+Success: True
+Exception: None
+Log:
+OSType: Windows
+OSVersion: 10.0 (build 19045)
+Reading environment variables... OK
+ Variables:
+HOMEPATH=\Users\Prentice
+DriverData=C:\Windows\System32\Drivers\DriverData
+COMPUTERNAME=DESKTOP-864TQ3I
+MSYSTEM=MINGW64
+CommonProgramFiles(x86)=C:\Program Files (x86)\Common Files
+ZSH_TMUX_AUTOSTART=false
+OneDrive=C:\Users\Prentice\OneDrive
+ChocolateyLastPathUpdate=134112127744968546
+LEVEL_ZERO_V1_SDK_PATH=C:\Program Files\LevelZeroSDK\1.26.1\
+CODEX_SHELL=1
+PROCESSOR_REVISION=bf02
+PROCESSOR_ARCHITECTURE=x86
+PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PY;.PYW;.CPL
+VSCODE_INJECTION=1
+GIT_ASKPASS=c:\Users\Prentice\AppData\Roaming\Code\User\globalStorage\vscode.git\askpass\493597c785d4c5cb\askpass.sh
+GIT_EXEC_PATH=C:/Program Files/Git/mingw64/libexec/git-core
+TEMP=C:\Users\Prentice\AppData\Local\Temp
+LOCALAPPDATA=C:\Users\Prentice\AppData\Local
+PUBLIC=C:\Users\Public
+TERM=xterm-256color
+PROCESSOR_IDENTIFIER=Intel64 Family 6 Model 191 Stepping 2, GenuineIntel
+GIT_EDITOR=:
+VSCODE_PYTHON_AUTOACTIVATE_GUARD=1
+ProgramW6432=C:\Program Files
+PYTHONSTARTUP=c:\Users\Prentice\AppData\Roaming\Code\User\workspaceStorage\a2a644114fbf0fb652e777454e2fcf1e\ms-python.python\pythonrc.py
+USERDOMAIN=DESKTOP-864TQ3I
+ProgramFiles(x86)=C:\Program Files (x86)
+Path=C:/Program Files/Git/mingw64/libexec/git-core;C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\bin;C:\Users\Prentice\bin;c:\Users\Prentice\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;c:\Users\Prentice\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\copilotCli;C:\Python314\Scripts\;C:\Python314\;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\ProgramData\chocolatey\bin;C:\Program Files\Microsoft VS Code\bin;C:\Program Files\Git\cmd;C:\Program Files\nodejs\;C:\Program Files\Tailscale\;C:\Program Files\Nefarius Software Solutions\Nefarius VirtualPad Driver Runtime\runtime\x64;C:\Users\Prentice\.local\bin;C:\Users\Prentice\AppData\Local\Microsoft\WindowsApps;D:\SteamLibrary\steamapps\common\DSX\Main_v3_Beta\;D:\SteamLibrary\steamapps\common\DSX\Main_v3_Beta\Console;C:\Users\Prentice\AppData\Roaming\npm;C:\Users\Prentice\.lmstudio\bin;D:\Program\fastboot
+TERM_PROGRAM=vscode
+PROCESSOR_LEVEL=6
+NUMBER_OF_PROCESSORS=12
+TMPDIR=C:\Users\Prentice\AppData\Local\Temp
+VSCODE_GIT_ASKPASS_EXTRA_ARGS=
+TERM_PROGRAM_VERSION=1.111.0
+VSCODE_GIT_ASKPASS_MAIN=c:\Users\Prentice\AppData\Roaming\Code\User\globalStorage\vscode.git\askpass\493597c785d4c5cb\askpass-main.js
+PSModulePath=C:\Users\Prentice\Documents\WindowsPowerShell\Modules;C:\Program Files\WindowsPowerShell\Modules;C:\Windows\system32\WindowsPowerShell\v1.0\Modules
+VSCODE_GIT_IPC_HANDLE=\\.\pipe\vscode-git-94fcad8017-sock
+ZSH_TMUX_AUTOSTARTED=true
+CommonProgramFiles=C:\Program Files (x86)\Common Files
+TMP=C:\Users\Prentice\AppData\Local\Temp
+GIT_MERGE_AUTOEDIT=no
+CHROME_CRASHPAD_PIPE_NAME=\\.\pipe\crashpad_17852_VUQWDPRZDQZGAWZR
+PLINK_PROTOCOL=ssh
+ProgramData=C:\ProgramData
+ProgramFiles=C:\Program Files (x86)
+GIT_PAGER=cat
+ChocolateyInstall=C:\ProgramData\chocolatey
+GIT_TRACE2_PARENT_SID=9a7f0b2b-58f3-400c-80f9-be7c7caa3fef
+CLAUDE_CODE_SSE_PORT=59398
+VSCODE_GIT_ASKPASS_NODE=C:\Program Files\Microsoft VS Code\Code.exe
+SystemRoot=C:\Windows
+SHELL=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+HOME=C:\Users\Prentice
+CommonProgramW6432=C:\Program Files\Common Files
+DISABLE_AUTO_UPDATE=true
+LOGONSERVER=\\DESKTOP-864TQ3I
+USERPROFILE=C:\Users\Prentice
+COLORTERM=truecolor
+USERDOMAIN_ROAMINGPROFILE=DESKTOP-864TQ3I
+APPDATA=C:\Users\Prentice\AppData\Roaming
+HOMEDRIVE=C:
+PYTHON_BASIC_REPL=1
+USERNAME=Prentice
+PROCESSOR_ARCHITEW6432=AMD64
+GIT_TERMINAL_PROMPT=0
+OS=Windows_NT
+ComSpec=C:\Windows\system32\cmd.exe
+SystemDrive=C:
+windir=C:\Windows
+LANG=zh_CN.UTF-8
+ALLUSERSPROFILE=C:\ProgramData
+
+
+------------
+Diagnostic: File system
+Skipped: False
+Success: True
+Exception: None
+Log:
+Temporary directory is 'C:\Users\Prentice\AppData\Local\Temp\'...
+Checking basic file I/O...
+Writing to temporary file 'C:\Users\Prentice\AppData\Local\Temp\61894ab5ad8e0c9150515310'... OK
+Reading from temporary file 'C:\Users\Prentice\AppData\Local\Temp\61894ab5ad8e0c9150515310'... OK
+Deleting temporary file 'C:\Users\Prentice\AppData\Local\Temp\61894ab5ad8e0c9150515310'... OK
+Testing IFileSystem instance...
+UserHomePath: C:\Users\Prentice
+UserDataDirectoryPath: C:\Users\Prentice\.gcm
+GetCurrentDirectory(): E:\开发项目\ESP32-HX711
+
+------------
+Diagnostic: Networking
+Skipped: False
+Success: True
+Exception: None
+Log:
+Checking networking and HTTP stack...
+Creating HTTP client... OK
+IsNetworkAvailable: True
+Sending HEAD request to http://example.com...Sending HEAD request to https://example.com... OK
+Acquiring free TCP port... OK
+Testing local HTTP loopback connections...
+Creating new HTTP listener for http://localhost:62853/... OK
+Waiting for loopback connection... OK
+Writing response... OK
+Waiting for response data... OK
+Loopback connection data OK
+
+------------
+Diagnostic: Git
+Skipped: False
+Success: True
+Exception: None
+Log:
+Getting Git version... OK
+Git version is '2.52.0.windows.1'
+Locating current repository...Git repository at 'E:/开发项目/ESP32-HX711/.git'
+ OK
+Listing all Git configuration... OK
+Git configuration:
+file:C:/Program Files/Git/etc/gitconfig	diff.astextplain.textconv=astextplain
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.clean=git-lfs clean -- %f
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.smudge=git-lfs smudge -- %f
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.process=git-lfs filter-process
+file:C:/Program Files/Git/etc/gitconfig	filter.lfs.required=true
+file:C:/Program Files/Git/etc/gitconfig	http.sslbackend=schannel
+file:C:/Program Files/Git/etc/gitconfig	core.autocrlf=true
+file:C:/Program Files/Git/etc/gitconfig	core.fscache=true
+file:C:/Program Files/Git/etc/gitconfig	core.symlinks=false
+file:C:/Program Files/Git/etc/gitconfig	pull.rebase=false
+file:C:/Program Files/Git/etc/gitconfig	credential.helper=manager
+file:C:/Program Files/Git/etc/gitconfig	credential.https://dev.azure.com.usehttppath=true
+file:C:/Program Files/Git/etc/gitconfig	init.defaultbranch=master
+file:C:/Users/Prentice/.gitconfig	user.email=13158509378@stu.xust.edu.cn
+file:C:/Users/Prentice/.gitconfig	user.name=Prentice
+file:.git/config	core.repositoryformatversion=0
+file:.git/config	core.filemode=true
+file:.git/config	core.bare=false
+file:.git/config	core.logallrefupdates=true
+file:.git/config	core.ignorecase=true
+file:.git/config	core.precomposeunicode=true
+file:.git/config	remote.origin.url=https://github.com/Prentice-d/ESP32-C3-stepper-hx711.git
+file:.git/config	remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+file:.git/config	branch.42Stepping.remote=origin
+file:.git/config	branch.42Stepping.merge=refs/heads/42Stepping
+
+
+------------
+Diagnostic: Credential storage
+Skipped: False
+Success: True
+Exception: None
+Log:
+ICredentialStore instance is of type: CredentialStore
+Writing test credential... OK
+Reading test credential... OK
+Deleting test credential... OK
+
+------------
+Diagnostic: Microsoft authentication (AAD/MSA)
+Skipped: False
+Success: True
+Exception: None
+Log:
+Broker is not enabled.
+Flow type is: Auto
+Gathering MSAL token cache data... OK
+CacheDirectory: C:\Users\Prentice\AppData\Local\.IdentityService
+CacheFileName: msal.cache
+CacheFilePath: C:\Users\Prentice\AppData\Local\.IdentityService\msal.cache
+Creating cache helper... OK
+Verifying MSAL token cache persistence... OK
+

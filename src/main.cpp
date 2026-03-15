@@ -141,7 +141,7 @@ const float MM_PER_STEP = 1.0 / STEPS_PER_MM;
 
 // ==================== 运动参数 ====================
 
-float targetSpeed = 50.0;           // mm/s
+float targetSpeed = 10.0;           // mm/s
 float targetDistance = 100.0;       // mm
 uint32_t targetTime = 10;           // 秒
 uint32_t accelTime = 1500;          // ms (加长加速时间减少震动)
@@ -176,14 +176,32 @@ const uint32_t DITHER_AMOUNT = 5;         // 脉冲抖动量 (微秒) - 减小�
 const float RESONANCE_ACCEL_BOOST = 1.5;  // 共振区加速倍率 - 快速通过
 
 enum MotionMode { MODE_CONTINUOUS, MODE_DISTANCE, MODE_RECIPROCATE, MODE_RESONANCE_SCAN };
-MotionMode motionMode = MODE_CONTINUOUS;
+MotionMode motionMode = MODE_DISTANCE;
 
 // ==================== 菜单系统 (WouoUI 风格丝滑动画) ====================
 
-enum MenuState { MENU_MAIN, MENU_RUNNING, MENU_COMPLETED, MENU_CALIBRATE };
+enum MenuState { MENU_MAIN, MENU_RUNNING, MENU_COMPLETED, MENU_CALIBRATE, MENU_EDIT_PARAM };
 MenuState currentMenu = MENU_MAIN;
 int menuIndex = 0;
 const int MENU_ITEMS = 12;
+
+enum EditField {
+    EDIT_NONE = -1,
+    EDIT_SPEED = 0,
+    EDIT_DISTANCE,
+    EDIT_TIME,
+    EDIT_ACCEL,
+    EDIT_DIRECTION,
+    EDIT_MODE
+};
+
+enum RunEndReason { END_COMPLETED, END_STOPPED };
+
+EditField editingField = EDIT_NONE;
+int32_t editIntValue = 0;
+bool editBoolValue = false;
+MotionMode editModeValue = MODE_CONTINUOUS;
+RunEndReason lastRunEndReason = END_COMPLETED;
 
 // WouoUI 风格动画参数
 #define LIST_FONT_H     8       // 字体高度
@@ -301,12 +319,31 @@ void startCalibration();
 void doCalibrationStep();
 void cancelCalibration();
 void drawCalibrationScreen();
+void drawEditScreen();
 void updateDisplay();
 void drawMainMenu();
 void drawRunningScreen();
 void drawScanScreen();
 void drawPhyphoxScreen();
 void drawCompletedScreen();
+void drawStatusBar();
+void drawScreenTitle(const __FlashStringHelper *title, const char* rightText = nullptr);
+void drawFooterHint(const char* text);
+void drawProgressBar(int y, int h, float progress);
+void drawInfoRow(int y, const char* leftLabel, const char* leftValue, const char* rightLabel = nullptr, const char* rightValue = nullptr);
+const char* motionModeLabel(MotionMode mode);
+void formatMenuPreview(int index, char* buf, size_t size);
+void beginEditField(EditField field);
+void applyEditField();
+void cancelEditField();
+void formatEditValue(char* buf, size_t size);
+void renderMainMenu();
+void renderEditScreen();
+void renderRunningScreen();
+void renderPhyphoxScreen();
+void renderScanScreen();
+void renderCompletedScreen();
+void renderCalibrationScreen();
 float sCurveSpeed(uint32_t elapsedMs, uint32_t accelMs, uint32_t totalMs, float maxSpeed);
 uint32_t speedToInterval(float speed);
 void updateMotionParams();
@@ -651,6 +688,8 @@ void startPhyphoxMode() {
     Serial.println("Connect with Phyphox app!");
     
     phyphoxMode = true;
+    isPaused = false;
+    lastRunEndReason = END_COMPLETED;
     bleStartTime = millis();
     stepCounter = 0;
     
@@ -667,8 +706,10 @@ void stopPhyphoxMode(bool keepLocked) {
     Serial.println(">>> PHYPHOX MODE STOP <<<");
     phyphoxMode = false;
     isRunning = false;
+    isPaused = false;
     currentSpeed = 0;
     stepInterval = 100000;
+    lastRunEndReason = keepLocked ? END_COMPLETED : END_STOPPED;
     
     // 自然结束后保持抱闸，手动停止时允许解锁。
     enableMotor(keepLocked);
@@ -926,6 +967,7 @@ void startMotion() {
     
     isRunning = true;
     isPaused = false;
+    lastRunEndReason = END_COMPLETED;
     stepCounter = 0;
     reciprocateCount = 0;
     runStartTime = millis();
@@ -948,6 +990,7 @@ void stopMotion(bool keepLocked) {
     isPaused = false;
     currentSpeed = 0;
     stepInterval = 100000;  // 停止脉冲输出
+    lastRunEndReason = keepLocked ? END_COMPLETED : END_STOPPED;
     
     // 自然结束后保持抱闸，手动停止时允许解锁。
     enableMotor(keepLocked);
@@ -971,9 +1014,12 @@ void startResonanceScan() {
     Serial.println("Watch/listen for vibration peaks!");
     
     resonanceScanMode = true;
+    isPaused = false;
+    lastRunEndReason = END_COMPLETED;
     scanSpeed = SCAN_MIN_SPEED;
     lastScanStepTime = millis();
     stepCounter = 0;
+    runStartTime = millis();
     
     setDirection(true);
     enableMotor(true);
@@ -1010,6 +1056,7 @@ void updateResonanceScan() {
             resonanceScanMode = false;
             currentSpeed = 0;
             stepInterval = 100000;
+            lastRunEndReason = END_COMPLETED;
             enableMotor(true);
             motorLocked = true;
             currentMenu = MENU_COMPLETED;
@@ -1078,6 +1125,34 @@ void processButtons() {
     if (!up && !down && !enter && !back) return;
     
     lastButtonTime = millis();
+
+    if (currentMenu == MENU_EDIT_PARAM) {
+        if (up) {
+            switch (editingField) {
+                case EDIT_SPEED: editIntValue = constrain(editIntValue + 1, 1, 200); break;
+                case EDIT_DISTANCE: editIntValue = constrain(editIntValue + 10, 1, 400); break;
+                case EDIT_TIME: editIntValue = constrain(editIntValue + 1, 1, 3600); break;
+                case EDIT_ACCEL: editIntValue = constrain(editIntValue + 50, 100, 2000); break;
+                case EDIT_DIRECTION: editBoolValue = !editBoolValue; break;
+                case EDIT_MODE: editModeValue = (MotionMode)((editModeValue + 1) % 3); break;
+                default: break;
+            }
+        }
+        if (down) {
+            switch (editingField) {
+                case EDIT_SPEED: editIntValue = constrain(editIntValue - 1, 1, 200); break;
+                case EDIT_DISTANCE: editIntValue = constrain(editIntValue - 10, 1, 400); break;
+                case EDIT_TIME: editIntValue = constrain(editIntValue - 1, 1, 3600); break;
+                case EDIT_ACCEL: editIntValue = constrain(editIntValue - 50, 100, 2000); break;
+                case EDIT_DIRECTION: editBoolValue = !editBoolValue; break;
+                case EDIT_MODE: editModeValue = (MotionMode)((editModeValue + 2) % 3); break;
+                default: break;
+            }
+        }
+        if (enter) applyEditField();
+        if (back) cancelEditField();
+        return;
+    }
     
     // 运行中、扫描中或Phyphox模式只响应暂停/停止
     if (isRunning || resonanceScanMode || phyphoxMode) {
@@ -1094,15 +1169,18 @@ void processButtons() {
         if (back) {
             if (resonanceScanMode) {
                 resonanceScanMode = false;
+                currentSpeed = 0;
+                stepInterval = 100000;
                 enableMotor(false);
                 motorLocked = false;
+                lastRunEndReason = END_STOPPED;
+                currentMenu = MENU_MAIN;
                 Serial.println("Scan stopped");
             } else if (phyphoxMode) {
                 stopPhyphoxMode(false);
             } else {
                 stopMotion(false);
             }
-            currentMenu = MENU_MAIN;
         }
         return;
     }
@@ -1138,12 +1216,12 @@ void processButtons() {
     
     if (enter) {
         switch (menuIndex) {
-            case 0: targetSpeed = constrain(targetSpeed + 1, 1, 200); break;
-            case 1: targetDistance = constrain(targetDistance + 10, 1, 400); break;
-            case 2: targetTime = constrain(targetTime + 1, 1, 3600); break;
-            case 3: accelTime = constrain(accelTime + 50, 100, 2000); break;
-            case 4: direction = !direction; break;
-            case 5: motionMode = (MotionMode)((motionMode + 1) % 3); break;
+            case 0: beginEditField(EDIT_SPEED); break;
+            case 1: beginEditField(EDIT_DISTANCE); break;
+            case 2: beginEditField(EDIT_TIME); break;
+            case 3: beginEditField(EDIT_ACCEL); break;
+            case 4: beginEditField(EDIT_DIRECTION); break;
+            case 5: beginEditField(EDIT_MODE); break;
             case 6: startResonanceScan(); break;  // 共振扫描
             case 7: startPhyphoxMode(); break;    // Phyphox 实验模式
             case 8: tareForce(); break;           // 力传感器归零
@@ -1164,14 +1242,7 @@ void processButtons() {
     }
     
     if (back) {
-        switch (menuIndex) {
-            case 0: targetSpeed = constrain(targetSpeed - 1, 1, 200); break;
-            case 1: targetDistance = constrain(targetDistance - 10, 1, 400); break;
-            case 2: targetTime = constrain(targetTime - 1, 1, 3600); break;
-            case 3: accelTime = constrain(accelTime - 50, 100, 2000); break;
-            case 4: direction = !direction; break;
-            case 5: motionMode = (MotionMode)((motionMode + 2) % 3); break;
-        }
+        return;
     }
 }
 
@@ -1201,8 +1272,9 @@ void uiMenuInit() {
 
 // 更新菜单动画目标值
 void uiMenuAnimUpdate() {
-    // 计算选择框目标位置 (相对于显示区域)
-    int visibleLines = (SCREEN_HEIGHT - 10) / LIST_LINE_H;  // 可见行数 (减去标题栏)
+    const int menuTop = 22;
+    const int menuBottom = 54;
+    int visibleLines = max(1, (menuBottom - menuTop) / LIST_LINE_H);
     int halfVisible = visibleLines / 2;
     
     // 计算列表偏移目标
@@ -1214,16 +1286,12 @@ void uiMenuAnimUpdate() {
         uiList.y_trg = -((menuIndex - halfVisible) * LIST_LINE_H);
     }
     
-    // 选择框Y位置目标 (在屏幕上的绝对位置)
-    uiList.box_y_trg = 10 + (menuIndex * LIST_LINE_H) + uiList.y_trg;
+    uiList.box_y_trg = menuTop + (menuIndex * LIST_LINE_H) + uiList.y_trg;
     
-    // 滚动条位置目标
     if (MENU_ITEMS > 1) {
-        uiList.bar_y_trg = (float)menuIndex / (MENU_ITEMS - 1) * (SCREEN_HEIGHT - 20);
+        uiList.bar_y_trg = (float)menuIndex / (MENU_ITEMS - 1) * max(1, (menuBottom - menuTop - 4));
     }
     
-    // 选择框宽度目标 (根据当前菜单项文字长度)
-    // 简化: 使用固定宽度或根据菜单项动态调整
     uiList.box_w_trg = 120;  // 几乎全宽
 }
 
@@ -1236,24 +1304,27 @@ void updateDisplay() {
     display.clearDisplay();
     
     if (calibrationMode) {
-        drawCalibrationScreen();
+        renderCalibrationScreen();
     } else if (phyphoxMode) {
-        drawPhyphoxScreen();
+        renderPhyphoxScreen();
     } else if (resonanceScanMode) {
-        drawScanScreen();
+        renderScanScreen();
     } else {
         switch (currentMenu) {
             case MENU_MAIN:
-                drawMainMenu();
+                renderMainMenu();
                 break;
             case MENU_RUNNING:
-                drawRunningScreen();
+                renderRunningScreen();
                 break;
             case MENU_COMPLETED:
-                drawCompletedScreen();
+                renderCompletedScreen();
                 break;
             case MENU_CALIBRATE:
-                drawCalibrationScreen();
+                renderCalibrationScreen();
+                break;
+            case MENU_EDIT_PARAM:
+                renderEditScreen();
                 break;
         }
     }
@@ -1533,5 +1604,335 @@ void drawCalibrationScreen() {
         display.println(F(" N"));
         display.println(F(""));
         display.println(F("[ENTER] to exit"));
+    }
+}
+
+void drawStatusBar() {
+    char status[22];
+    snprintf(status, sizeof(status), "%s %s %s",
+        motorLocked ? "LOCK" : "FREE",
+        bleConnected ? "BLE" : "---",
+        hx711Ready ? "HX" : "--");
+
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.fillRect(0, 0, SCREEN_WIDTH, 9, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(2, 1);
+    display.print(status);
+}
+
+void drawScreenTitle(const __FlashStringHelper *title, const char* rightText) {
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 12);
+    display.print(title);
+    if (rightText) {
+        int16_t x1, y1;
+        uint16_t w, h;
+        display.getTextBounds(rightText, 0, 0, &x1, &y1, &w, &h);
+        display.setCursor(SCREEN_WIDTH - w, 12);
+        display.print(rightText);
+    }
+}
+
+void drawFooterHint(const char* text) {
+    display.fillRect(0, 54, SCREEN_WIDTH, 10, SSD1306_BLACK);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 55);
+    display.print(text);
+}
+
+void drawProgressBar(int y, int h, float progress) {
+    progress = constrain(progress, 0.0f, 1.0f);
+    display.drawRect(0, y, SCREEN_WIDTH, h, SSD1306_WHITE);
+    int fillWidth = max(0, (int)((SCREEN_WIDTH - 4) * progress));
+    display.fillRect(2, y + 2, fillWidth, max(1, h - 4), SSD1306_WHITE);
+}
+
+void drawInfoRow(int y, const char* leftLabel, const char* leftValue, const char* rightLabel, const char* rightValue) {
+    char buf[24];
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    snprintf(buf, sizeof(buf), "%s:%s", leftLabel, leftValue);
+    display.setCursor(0, y);
+    display.print(buf);
+
+    if (rightLabel && rightValue) {
+        snprintf(buf, sizeof(buf), "%s:%s", rightLabel, rightValue);
+        int16_t x1, y1;
+        uint16_t w, h;
+        display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+        display.setCursor(SCREEN_WIDTH - w, y);
+        display.print(buf);
+    }
+}
+
+const char* motionModeLabel(MotionMode mode) {
+    switch (mode) {
+        case MODE_CONTINUOUS: return "CONT";
+        case MODE_DISTANCE: return "DIST";
+        case MODE_RECIPROCATE: return "RECIP";
+        case MODE_RESONANCE_SCAN: return "SCAN";
+        default: return "---";
+    }
+}
+
+void formatMenuPreview(int index, char* buf, size_t size) {
+    switch (index) {
+        case 0: snprintf(buf, size, "%3d", (int)targetSpeed); break;
+        case 1: snprintf(buf, size, "%3d", (int)targetDistance); break;
+        case 2: snprintf(buf, size, "%3d", (int)targetTime); break;
+        case 3: snprintf(buf, size, "%4d", (int)accelTime); break;
+        case 4: snprintf(buf, size, "%s", direction ? "FWD" : "REV"); break;
+        case 5: snprintf(buf, size, "%s", motionModeLabel(motionMode)); break;
+        case 6: snprintf(buf, size, ">"); break;
+        case 7: snprintf(buf, size, bleConnected ? "LIVE" : "READY"); break;
+        case 8: snprintf(buf, size, "%.2fN", forceReading); break;
+        case 9: snprintf(buf, size, "100g"); break;
+        case 10: snprintf(buf, size, motorLocked ? "ON" : "OFF"); break;
+        case 11: snprintf(buf, size, ">"); break;
+        default: buf[0] = '\0'; break;
+    }
+}
+
+void beginEditField(EditField field) {
+    editingField = field;
+    switch (field) {
+        case EDIT_SPEED: editIntValue = (int32_t)targetSpeed; break;
+        case EDIT_DISTANCE: editIntValue = (int32_t)targetDistance; break;
+        case EDIT_TIME: editIntValue = (int32_t)targetTime; break;
+        case EDIT_ACCEL: editIntValue = (int32_t)accelTime; break;
+        case EDIT_DIRECTION: editBoolValue = direction; break;
+        case EDIT_MODE: editModeValue = motionMode; break;
+        default: return;
+    }
+    currentMenu = MENU_EDIT_PARAM;
+}
+
+void applyEditField() {
+    switch (editingField) {
+        case EDIT_SPEED: targetSpeed = editIntValue; break;
+        case EDIT_DISTANCE: targetDistance = editIntValue; break;
+        case EDIT_TIME: targetTime = editIntValue; break;
+        case EDIT_ACCEL: accelTime = editIntValue; break;
+        case EDIT_DIRECTION: direction = editBoolValue; break;
+        case EDIT_MODE: editModeValue = (MotionMode)(editModeValue % 3); motionMode = editModeValue; break;
+        default: break;
+    }
+    editingField = EDIT_NONE;
+    currentMenu = MENU_MAIN;
+}
+
+void cancelEditField() {
+    editingField = EDIT_NONE;
+    currentMenu = MENU_MAIN;
+}
+
+void formatEditValue(char* buf, size_t size) {
+    switch (editingField) {
+        case EDIT_SPEED: snprintf(buf, size, "%ld mm/s", (long)editIntValue); break;
+        case EDIT_DISTANCE: snprintf(buf, size, "%ld mm", (long)editIntValue); break;
+        case EDIT_TIME: snprintf(buf, size, "%ld s", (long)editIntValue); break;
+        case EDIT_ACCEL: snprintf(buf, size, "%ld ms", (long)editIntValue); break;
+        case EDIT_DIRECTION: snprintf(buf, size, "%s", editBoolValue ? "FWD" : "REV"); break;
+        case EDIT_MODE: snprintf(buf, size, "%s", motionModeLabel(editModeValue)); break;
+        default: snprintf(buf, size, "--"); break;
+    }
+}
+
+void renderMainMenu() {
+    drawStatusBar();
+    uiMenuAnimUpdate();
+    uiAnimation(&uiList.y, &uiList.y_trg, UI_ANI_SPEED);
+    uiAnimation(&uiList.box_y, &uiList.box_y_trg, UI_ANI_SPEED);
+    uiAnimation(&uiList.box_w, &uiList.box_w_trg, UI_ANI_SPEED);
+    uiAnimation(&uiList.bar_y, &uiList.bar_y_trg, UI_ANI_SPEED);
+
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 12);
+    display.print(F("MAIN MENU"));
+
+    for (int i = 0; i < MENU_ITEMS; i++) {
+        int lineY = 22 + i * LIST_LINE_H + (int)uiList.y;
+        if (lineY >= 22 && lineY < 54) {
+            char preview[16];
+            formatMenuPreview(i, preview, sizeof(preview));
+            display.setCursor(2, lineY);
+            display.print(menuLabels[i]);
+            int16_t x1, y1;
+            uint16_t w, h;
+            display.getTextBounds(preview, 0, 0, &x1, &y1, &w, &h);
+            display.setCursor(SCREEN_WIDTH - LIST_BAR_W - 3 - w, lineY);
+            display.print(preview);
+        }
+    }
+
+    int boxY = 22 + (menuIndex * LIST_LINE_H) + (int)uiList.y;
+    int boxW = SCREEN_WIDTH - LIST_BAR_W - 2;
+    if (boxY >= 21 && boxY < 54) {
+        for (int y = boxY; y < boxY + LIST_LINE_H && y < 54; y++) {
+            for (int x = 0; x < boxW; x++) {
+                display.drawPixel(x, y, display.getPixel(x, y) ? SSD1306_BLACK : SSD1306_WHITE);
+            }
+        }
+    }
+
+    int visibleLines = max(1, (54 - 22) / LIST_LINE_H);
+    if (MENU_ITEMS > visibleLines) {
+        int barH = max(4, (54 - 22) / MENU_ITEMS);
+        int barY = 22 + (menuIndex * ((54 - 22) - barH)) / max(1, MENU_ITEMS - 1);
+        display.drawRect(SCREEN_WIDTH - LIST_BAR_W, 22, LIST_BAR_W, 32, SSD1306_WHITE);
+        display.fillRect(SCREEN_WIDTH - LIST_BAR_W + 1, barY, LIST_BAR_W - 2, barH, SSD1306_WHITE);
+    }
+}
+
+void renderEditScreen() {
+    drawStatusBar();
+
+    const __FlashStringHelper* title = F("SET VALUE");
+    switch (editingField) {
+        case EDIT_SPEED: title = F("SET SPEED"); break;
+        case EDIT_DISTANCE: title = F("SET DIST"); break;
+        case EDIT_TIME: title = F("SET TIME"); break;
+        case EDIT_ACCEL: title = F("SET ACCEL"); break;
+        case EDIT_DIRECTION: title = F("SET DIR"); break;
+        case EDIT_MODE: title = F("SET MODE"); break;
+        default: break;
+    }
+    drawScreenTitle(title);
+
+    char value[20];
+    formatEditValue(value, sizeof(value));
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.setTextSize(2);
+    display.getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((SCREEN_WIDTH - w) / 2, 28);
+    display.print(value);
+
+    display.setTextSize(1);
+    display.setCursor(0, 48);
+    display.print(F("UP/DN +/-"));
+    drawFooterHint("ENT Save  BK Exit");
+}
+
+void renderRunningScreen() {
+    uint32_t elapsed = millis() - runStartTime;
+    float dist = stepCounter * MM_PER_STEP;
+
+    drawStatusBar();
+    drawScreenTitle(isPaused ? F("PAUSED") : F("RUNNING"), motorLocked ? "LOCK" : "FREE");
+
+    char left[16], right[16];
+    snprintf(left, sizeof(left), "%.1f", currentSpeed);
+    snprintf(right, sizeof(right), "%.1f", dist);
+    drawInfoRow(24, "SPD", left, "DST", right);
+
+    snprintf(left, sizeof(left), "%.1f", elapsed / 1000.0f);
+    if (motionMode == MODE_DISTANCE) snprintf(right, sizeof(right), "%.0fmm", targetDistance);
+    else snprintf(right, sizeof(right), "%lus", (unsigned long)targetTime);
+    drawInfoRow(32, "ELP", left, "TGT", right);
+
+    if (motionMode == MODE_RECIPROCATE) snprintf(right, sizeof(right), "%d", reciprocateCount);
+    else snprintf(right, sizeof(right), "%lu", (unsigned long)stepCounter);
+    drawInfoRow(40, "MODE", motionModeLabel(motionMode), motionMode == MODE_RECIPROCATE ? "CYC" : "STEP", right);
+
+    drawProgressBar(45, 8, (float)elapsed / (targetTime * 1000.0f));
+    drawFooterHint("ENT Pause  BK Stop");
+}
+
+void renderPhyphoxScreen() {
+    float elapsed = (millis() - bleStartTime) / 1000.0f;
+    float dist = stepCounter * MM_PER_STEP;
+
+    drawStatusBar();
+    drawScreenTitle(bleConnected ? F("PHYPHOX LIVE") : F("PHYPHOX READY"), motorLocked ? "LOCK" : "FREE");
+
+    char left[16], right[16];
+    snprintf(left, sizeof(left), "%.3f", forceReading);
+    snprintf(right, sizeof(right), "%.1f", currentSpeed);
+    drawInfoRow(24, "FORCE", left, "SPD", right);
+
+    snprintf(left, sizeof(left), "%.1f", dist);
+    snprintf(right, sizeof(right), "%.1f", elapsed);
+    drawInfoRow(32, "DIST", left, "TIME", right);
+
+    drawProgressBar(45, 8, elapsed / targetTime);
+    drawFooterHint(bleConnected ? "Streaming 20 Hz" : "Open app to connect");
+}
+
+void renderScanScreen() {
+    float freq = scanSpeed * STEPS_PER_MM;
+    char value[18];
+
+    drawStatusBar();
+    drawScreenTitle(F("SCAN"), motorLocked ? "LOCK" : "FREE");
+
+    display.setTextSize(2);
+    snprintf(value, sizeof(value), "%.1f", scanSpeed);
+    display.setCursor(18, 24);
+    display.print(value);
+    display.setTextSize(1);
+    display.print(F(" mm/s"));
+
+    snprintf(value, sizeof(value), "%.0f Hz", freq);
+    drawInfoRow(40, "FREQ", value);
+    drawProgressBar(45, 8, (scanSpeed - SCAN_MIN_SPEED) / (SCAN_MAX_SPEED - SCAN_MIN_SPEED));
+    drawFooterHint("Feel resonance? BK");
+}
+
+void renderCompletedScreen() {
+    float dist = stepCounter * MM_PER_STEP;
+    uint32_t elapsed = millis() - runStartTime;
+    char left[16], right[16];
+
+    drawStatusBar();
+    drawScreenTitle(lastRunEndReason == END_COMPLETED ? F("COMPLETED") : F("STOPPED"),
+        motorLocked ? "LOCK" : "FREE");
+
+    snprintf(left, sizeof(left), "%.1f", dist);
+    snprintf(right, sizeof(right), "%.1f", elapsed / 1000.0f);
+    drawInfoRow(24, "DIST", left, "TIME", right);
+
+    if (elapsed > 0) snprintf(left, sizeof(left), "%.1f", dist / (elapsed / 1000.0f));
+    else snprintf(left, sizeof(left), "0.0");
+    drawInfoRow(32, "AVG", left, "LOCK", motorLocked ? "ON" : "OFF");
+
+    snprintf(right, sizeof(right), "%lu", (unsigned long)stepCounter);
+    drawInfoRow(40, "STEP", right);
+    drawFooterHint("ENT/BK Home");
+}
+
+void renderCalibrationScreen() {
+    drawStatusBar();
+    drawScreenTitle(F("CALIBRATION"));
+
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    if (calibrationStep == 0) {
+        display.setCursor(0, 24);
+        display.print(F("REMOVE LOAD"));
+        display.setCursor(0, 36);
+        display.print(F("Sensor must be empty"));
+        drawFooterHint("ENT Confirm  BK Exit");
+    } else if (calibrationStep == 1) {
+        display.setCursor(0, 24);
+        display.print(F("PLACE 100 g"));
+        display.setCursor(0, 36);
+        display.print(F("Put weight on sensor"));
+        drawFooterHint("ENT Confirm  BK Exit");
+    } else {
+        char factor[16];
+        char force[16];
+        snprintf(factor, sizeof(factor), "%.1f", forceCalibration);
+        snprintf(force, sizeof(force), "%.3f", forceReading);
+        display.setCursor(0, 24);
+        display.print(F("CAL DONE"));
+        drawInfoRow(36, "FACTOR", factor, "FORCE", force);
+        drawFooterHint("ENT/BK Home");
     }
 }
