@@ -283,11 +283,11 @@ void setDirection(bool dir);
 void processButtons();
 void runMotorStep();
 void startMotion();
-void stopMotion();
+void stopMotion(bool keepLocked = true);
 void startResonanceScan();
 void updateResonanceScan();
 void startPhyphoxMode();
-void stopPhyphoxMode();
+void stopPhyphoxMode(bool keepLocked = true);
 void updatePhyphox();
 void sendBLEData();
 void readForce();
@@ -663,16 +663,16 @@ void startPhyphoxMode() {
     currentMenu = MENU_RUNNING;
 }
 
-void stopPhyphoxMode() {
+void stopPhyphoxMode(bool keepLocked) {
     Serial.println(">>> PHYPHOX MODE STOP <<<");
     phyphoxMode = false;
     isRunning = false;
     currentSpeed = 0;
     stepInterval = 100000;
     
-    // 停止后保持解锁状态（用户可手动锁定）
-    enableMotor(false);
-    motorLocked = false;
+    // 自然结束后保持抱闸，手动停止时允许解锁。
+    enableMotor(keepLocked);
+    motorLocked = keepLocked;
     
     currentMenu = MENU_COMPLETED;
 }
@@ -942,17 +942,17 @@ void startMotion() {
     Serial.print("Accel time: "); Serial.print(accelTime); Serial.println(" ms");
 }
 
-void stopMotion() {
+void stopMotion(bool keepLocked) {
     Serial.println(">>> STOP MOTION <<<");
     isRunning = false;
     isPaused = false;
     currentSpeed = 0;
     stepInterval = 100000;  // 停止脉冲输出
     
-    // 运行结束后保持解锁状态（用户可手动锁定）
-    enableMotor(false);
-    motorLocked = false;
-    Serial.println("Motion stopped (motor unlocked)");
+    // 自然结束后保持抱闸，手动停止时允许解锁。
+    enableMotor(keepLocked);
+    motorLocked = keepLocked;
+    Serial.println(keepLocked ? "Motion stopped (motor locked)" : "Motion stopped (motor unlocked)");
     
     currentMenu = MENU_COMPLETED;
     
@@ -1010,8 +1010,8 @@ void updateResonanceScan() {
             resonanceScanMode = false;
             currentSpeed = 0;
             stepInterval = 100000;
-            enableMotor(false);
-            motorLocked = false;
+            enableMotor(true);
+            motorLocked = true;
             currentMenu = MENU_COMPLETED;
         }
     }
@@ -1095,11 +1095,12 @@ void processButtons() {
             if (resonanceScanMode) {
                 resonanceScanMode = false;
                 enableMotor(false);
+                motorLocked = false;
                 Serial.println("Scan stopped");
             } else if (phyphoxMode) {
-                stopPhyphoxMode();
+                stopPhyphoxMode(false);
             } else {
-                stopMotion();
+                stopMotion(false);
             }
             currentMenu = MENU_MAIN;
         }
