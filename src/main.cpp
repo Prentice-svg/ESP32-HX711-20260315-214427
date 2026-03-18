@@ -130,14 +130,18 @@ uint32_t bleStartTime = 0;
 // 线绕在轴上，电机转动时线缠绕/释放，拉动物体
 // 每转一圈，线移动距离 = π × 轴直径
 #define SPOOL_DIAMETER      7.0     // 绕线轴直径 (mm)
+// 位移校准系数：根据实测位移修正理论计算值
+// 当前实测 32.3 mm，而显示 30.2 mm，因此乘以 1.0695 进行校正
+#define DISTANCE_CAL_FACTOR_DEFAULT 1.0695f
 
 // 计算每毫米步数
 // 每圈线位移 = π × D = 3.14159 × 7 = 21.99 mm
 // 每圈总步数 = 200 × 32 = 6400 步
 // STEPS_PER_MM = 6400 / 21.99 ≈ 291.0 步/mm
-const float MM_PER_REV = PI * SPOOL_DIAMETER;   // 每转一圈的线位移 (mm)
-const float STEPS_PER_MM = (float)(STEPS_PER_REV * MICROSTEP_DIV) / MM_PER_REV;
-const float MM_PER_STEP = 1.0 / STEPS_PER_MM;
+float distanceCalFactor = DISTANCE_CAL_FACTOR_DEFAULT;
+float MM_PER_REV = 0.0f;   // 每转一圈的线位移 (mm)
+float STEPS_PER_MM = 0.0f;
+float MM_PER_STEP = 0.0f;
 
 // ==================== 运动参数 ====================
 
@@ -183,7 +187,7 @@ MotionMode motionMode = MODE_DISTANCE;
 enum MenuState { MENU_MAIN, MENU_RUNNING, MENU_COMPLETED, MENU_CALIBRATE, MENU_EDIT_PARAM };
 MenuState currentMenu = MENU_MAIN;
 int menuIndex = 0;
-const int MENU_ITEMS = 12;
+const int MENU_ITEMS = 13;
 
 enum EditField {
     EDIT_NONE = -1,
@@ -191,6 +195,7 @@ enum EditField {
     EDIT_DISTANCE,
     EDIT_TIME,
     EDIT_ACCEL,
+    EDIT_DIST_CAL,
     EDIT_DIRECTION,
     EDIT_MODE
 };
@@ -230,6 +235,7 @@ const char* menuLabels[] = {
     "Distance",
     "Time",
     "Accel",
+    "DistCal",
     "Direction",
     "Mode",
     "ResoScan",   // 共振扫描
@@ -315,6 +321,9 @@ void uiMenuAnimUpdate();
 void tareForce();
 void saveCalibration();
 bool loadCalibration();
+void updateDistanceMetrics();
+void saveDistanceCalibration();
+bool loadDistanceCalibration();
 void startCalibration();
 void doCalibrationStep();
 void cancelCalibration();
@@ -360,6 +369,8 @@ void setup() {
     Serial.println("========================================");
     Serial.println("  ESP32 Stepper + Phyphox Force Lab");
     Serial.println("========================================");
+
+    loadDistanceCalibration();
     
     initPins();
     initTimer();
@@ -372,6 +383,7 @@ void setup() {
     Serial.println("Ready!");
     Serial.println("\n--- 传动参数 (绕线轴) ---");
     Serial.print("轴直径 = "); Serial.print(SPOOL_DIAMETER); Serial.println(" mm");
+    Serial.print("位移校准 = "); Serial.println(distanceCalFactor, 4);
     Serial.print("每圈线位移 = "); Serial.print(MM_PER_REV, 2); Serial.println(" mm");
     Serial.print("微步细分 = 1/"); Serial.println(MICROSTEP_DIV);
     Serial.print("STEPS_PER_MM = "); Serial.println(STEPS_PER_MM, 2);
@@ -514,6 +526,36 @@ void tareForce() {
         Serial.println("Force tared!");
         Serial.print("New offset: "); Serial.println(rawValue);
     }
+}
+
+void updateDistanceMetrics() {
+    MM_PER_REV = PI * SPOOL_DIAMETER * distanceCalFactor;
+    STEPS_PER_MM = (float)(STEPS_PER_REV * MICROSTEP_DIV) / MM_PER_REV;
+    MM_PER_STEP = 1.0f / STEPS_PER_MM;
+}
+
+void saveDistanceCalibration() {
+    preferences.begin("motioncfg", false);
+    preferences.putFloat("distCal", distanceCalFactor);
+    preferences.end();
+    Serial.println("Distance calibration saved to NVS!");
+    Serial.print("  DistCal: "); Serial.println(distanceCalFactor, 4);
+}
+
+bool loadDistanceCalibration() {
+    preferences.begin("motioncfg", true);
+    float savedFactor = preferences.getFloat("distCal", DISTANCE_CAL_FACTOR_DEFAULT);
+    preferences.end();
+
+    if (savedFactor < 0.5000f || savedFactor > 1.5000f) {
+        savedFactor = DISTANCE_CAL_FACTOR_DEFAULT;
+    }
+
+    distanceCalFactor = savedFactor;
+    updateDistanceMetrics();
+    Serial.println("Distance calibration loaded");
+    Serial.print("  DistCal: "); Serial.println(distanceCalFactor, 4);
+    return true;
 }
 
 // 保存校准数据到NVS
@@ -711,9 +753,10 @@ void stopPhyphoxMode(bool keepLocked) {
     stepInterval = 100000;
     lastRunEndReason = keepLocked ? END_COMPLETED : END_STOPPED;
     
-    // 自然结束后保持抱闸，手动停止时允许解锁。
-    enableMotor(keepLocked);
-    motorLocked = keepLocked;
+    // 如果用户之前手动锁定过电机，则停止后保持锁定，直到手动解锁。
+    bool shouldStayLocked = keepLocked || motorLocked;
+    enableMotor(shouldStayLocked);
+    motorLocked = shouldStayLocked;
     
     currentMenu = MENU_COMPLETED;
 }
@@ -992,10 +1035,11 @@ void stopMotion(bool keepLocked) {
     stepInterval = 100000;  // 停止脉冲输出
     lastRunEndReason = keepLocked ? END_COMPLETED : END_STOPPED;
     
-    // 自然结束后保持抱闸，手动停止时允许解锁。
-    enableMotor(keepLocked);
-    motorLocked = keepLocked;
-    Serial.println(keepLocked ? "Motion stopped (motor locked)" : "Motion stopped (motor unlocked)");
+    // 如果用户之前手动锁定过电机，则停止后保持锁定，直到手动解锁。
+    bool shouldStayLocked = keepLocked || motorLocked;
+    enableMotor(shouldStayLocked);
+    motorLocked = shouldStayLocked;
+    Serial.println(shouldStayLocked ? "Motion stopped (motor locked)" : "Motion stopped (motor unlocked)");
     
     currentMenu = MENU_COMPLETED;
     
@@ -1133,6 +1177,7 @@ void processButtons() {
                 case EDIT_DISTANCE: editIntValue = constrain(editIntValue + 10, 1, 400); break;
                 case EDIT_TIME: editIntValue = constrain(editIntValue + 1, 1, 3600); break;
                 case EDIT_ACCEL: editIntValue = constrain(editIntValue + 50, 100, 2000); break;
+                case EDIT_DIST_CAL: editIntValue = constrain(editIntValue + 5, 5000, 15000); break;
                 case EDIT_DIRECTION: editBoolValue = !editBoolValue; break;
                 case EDIT_MODE: editModeValue = (MotionMode)((editModeValue + 1) % 3); break;
                 default: break;
@@ -1144,6 +1189,7 @@ void processButtons() {
                 case EDIT_DISTANCE: editIntValue = constrain(editIntValue - 10, 1, 400); break;
                 case EDIT_TIME: editIntValue = constrain(editIntValue - 1, 1, 3600); break;
                 case EDIT_ACCEL: editIntValue = constrain(editIntValue - 50, 100, 2000); break;
+                case EDIT_DIST_CAL: editIntValue = constrain(editIntValue - 5, 5000, 15000); break;
                 case EDIT_DIRECTION: editBoolValue = !editBoolValue; break;
                 case EDIT_MODE: editModeValue = (MotionMode)((editModeValue + 2) % 3); break;
                 default: break;
@@ -1171,8 +1217,7 @@ void processButtons() {
                 resonanceScanMode = false;
                 currentSpeed = 0;
                 stepInterval = 100000;
-                enableMotor(false);
-                motorLocked = false;
+                enableMotor(motorLocked);
                 lastRunEndReason = END_STOPPED;
                 currentMenu = MENU_MAIN;
                 Serial.println("Scan stopped");
@@ -1220,13 +1265,14 @@ void processButtons() {
             case 1: beginEditField(EDIT_DISTANCE); break;
             case 2: beginEditField(EDIT_TIME); break;
             case 3: beginEditField(EDIT_ACCEL); break;
-            case 4: beginEditField(EDIT_DIRECTION); break;
-            case 5: beginEditField(EDIT_MODE); break;
-            case 6: startResonanceScan(); break;  // 共振扫描
-            case 7: startPhyphoxMode(); break;    // Phyphox 实验模式
-            case 8: tareForce(); break;           // 力传感器归零
-            case 9: startCalibration(); break;    // 力传感器校准
-            case 10:  // 锁定/解锁电机 (手动控制)
+            case 4: beginEditField(EDIT_DIST_CAL); break;
+            case 5: beginEditField(EDIT_DIRECTION); break;
+            case 6: beginEditField(EDIT_MODE); break;
+            case 7: startResonanceScan(); break;  // 共振扫描
+            case 8: startPhyphoxMode(); break;    // Phyphox 实验模式
+            case 9: tareForce(); break;           // 力传感器归零
+            case 10: startCalibration(); break;   // 力传感器校准
+            case 11:  // 锁定/解锁电机 (手动控制)
                 if (motorLocked) {
                     enableMotor(false);
                     motorLocked = false;
@@ -1237,7 +1283,7 @@ void processButtons() {
                     Serial.println("Motor LOCKED");
                 }
                 break;
-            case 11: startMotion(); break;        // START
+            case 12: startMotion(); break;        // START
         }
     }
     
@@ -1373,18 +1419,19 @@ void drawMainMenu() {
                 case 1: snprintf(buf, sizeof(buf), "Dist:   %3d mm", (int)targetDistance); break;
                 case 2: snprintf(buf, sizeof(buf), "Time:   %3d s", (int)targetTime); break;
                 case 3: snprintf(buf, sizeof(buf), "Accel:  %4d ms", (int)accelTime); break;
-                case 4: snprintf(buf, sizeof(buf), "Dir:    %s", direction ? "FWD >>" : "<< REV"); break;
-                case 5: 
+                case 4: snprintf(buf, sizeof(buf), "DCal:   %.4f", distanceCalFactor); break;
+                case 5: snprintf(buf, sizeof(buf), "Dir:    %s", direction ? "FWD >>" : "<< REV"); break;
+                case 6: 
                     snprintf(buf, sizeof(buf), "Mode:   %s", 
                         motionMode == MODE_CONTINUOUS ? "Cont" :
                         motionMode == MODE_DISTANCE ? "Dist" : "Recip");
                     break;
-                case 6: snprintf(buf, sizeof(buf), ">> ResoScan"); break;
-                case 7: snprintf(buf, sizeof(buf), ">> Phyphox"); break;
-                case 8: snprintf(buf, sizeof(buf), "Tare    %.2fN", forceReading); break;
-                case 9: snprintf(buf, sizeof(buf), "Calibrate 100g"); break;
-                case 10: snprintf(buf, sizeof(buf), "%s Motor", motorLocked ? "Unlock" : "Lock"); break;
-                case 11: snprintf(buf, sizeof(buf), ">>> START <<<"); break;
+                case 7: snprintf(buf, sizeof(buf), ">> ResoScan"); break;
+                case 8: snprintf(buf, sizeof(buf), ">> Phyphox"); break;
+                case 9: snprintf(buf, sizeof(buf), "Tare    %.2fN", forceReading); break;
+                case 10: snprintf(buf, sizeof(buf), "Calibrate 100g"); break;
+                case 11: snprintf(buf, sizeof(buf), "%s Motor", motorLocked ? "Unlock" : "Lock"); break;
+                case 12: snprintf(buf, sizeof(buf), ">>> START <<<"); break;
             }
             display.print(buf);
         }
@@ -1686,14 +1733,15 @@ void formatMenuPreview(int index, char* buf, size_t size) {
         case 1: snprintf(buf, size, "%3d", (int)targetDistance); break;
         case 2: snprintf(buf, size, "%3d", (int)targetTime); break;
         case 3: snprintf(buf, size, "%4d", (int)accelTime); break;
-        case 4: snprintf(buf, size, "%s", direction ? "FWD" : "REV"); break;
-        case 5: snprintf(buf, size, "%s", motionModeLabel(motionMode)); break;
-        case 6: snprintf(buf, size, ">"); break;
-        case 7: snprintf(buf, size, bleConnected ? "LIVE" : "READY"); break;
-        case 8: snprintf(buf, size, "%.2fN", forceReading); break;
-        case 9: snprintf(buf, size, "100g"); break;
-        case 10: snprintf(buf, size, motorLocked ? "ON" : "OFF"); break;
-        case 11: snprintf(buf, size, ">"); break;
+        case 4: snprintf(buf, size, "%.3f", distanceCalFactor); break;
+        case 5: snprintf(buf, size, "%s", direction ? "FWD" : "REV"); break;
+        case 6: snprintf(buf, size, "%s", motionModeLabel(motionMode)); break;
+        case 7: snprintf(buf, size, ">"); break;
+        case 8: snprintf(buf, size, bleConnected ? "LIVE" : "READY"); break;
+        case 9: snprintf(buf, size, "%.2fN", forceReading); break;
+        case 10: snprintf(buf, size, "100g"); break;
+        case 11: snprintf(buf, size, motorLocked ? "ON" : "OFF"); break;
+        case 12: snprintf(buf, size, ">"); break;
         default: buf[0] = '\0'; break;
     }
 }
@@ -1705,6 +1753,7 @@ void beginEditField(EditField field) {
         case EDIT_DISTANCE: editIntValue = (int32_t)targetDistance; break;
         case EDIT_TIME: editIntValue = (int32_t)targetTime; break;
         case EDIT_ACCEL: editIntValue = (int32_t)accelTime; break;
+        case EDIT_DIST_CAL: editIntValue = (int32_t)(distanceCalFactor * 10000.0f + 0.5f); break;
         case EDIT_DIRECTION: editBoolValue = direction; break;
         case EDIT_MODE: editModeValue = motionMode; break;
         default: return;
@@ -1718,6 +1767,11 @@ void applyEditField() {
         case EDIT_DISTANCE: targetDistance = editIntValue; break;
         case EDIT_TIME: targetTime = editIntValue; break;
         case EDIT_ACCEL: accelTime = editIntValue; break;
+        case EDIT_DIST_CAL:
+            distanceCalFactor = editIntValue / 10000.0f;
+            updateDistanceMetrics();
+            saveDistanceCalibration();
+            break;
         case EDIT_DIRECTION: direction = editBoolValue; break;
         case EDIT_MODE: editModeValue = (MotionMode)(editModeValue % 3); motionMode = editModeValue; break;
         default: break;
@@ -1737,6 +1791,7 @@ void formatEditValue(char* buf, size_t size) {
         case EDIT_DISTANCE: snprintf(buf, size, "%ld mm", (long)editIntValue); break;
         case EDIT_TIME: snprintf(buf, size, "%ld s", (long)editIntValue); break;
         case EDIT_ACCEL: snprintf(buf, size, "%ld ms", (long)editIntValue); break;
+        case EDIT_DIST_CAL: snprintf(buf, size, "%.4f", editIntValue / 10000.0f); break;
         case EDIT_DIRECTION: snprintf(buf, size, "%s", editBoolValue ? "FWD" : "REV"); break;
         case EDIT_MODE: snprintf(buf, size, "%s", motionModeLabel(editModeValue)); break;
         default: snprintf(buf, size, "--"); break;
@@ -1799,6 +1854,7 @@ void renderEditScreen() {
         case EDIT_DISTANCE: title = F("SET DIST"); break;
         case EDIT_TIME: title = F("SET TIME"); break;
         case EDIT_ACCEL: title = F("SET ACCEL"); break;
+        case EDIT_DIST_CAL: title = F("DIST CAL"); break;
         case EDIT_DIRECTION: title = F("SET DIR"); break;
         case EDIT_MODE: title = F("SET MODE"); break;
         default: break;
