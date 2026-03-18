@@ -149,7 +149,7 @@ const doc = new Document({
       new Paragraph({
         spacing: { after: 200 },
         indent: { left: 720 },
-        children: [new TextRun("ESP32利用FreeRTOS多任务处理：电机控制任务、传感采集任务、BLE通信任务、UI更新任务并行运行，确保各环节协调。")]
+        children: [new TextRun("ESP32采用主循环配合硬件定时器中断的结构：定时器中断负责高精度输出步进脉冲，主循环负责按键、界面刷新、HX711读取和BLE数据发送。这样既保证了运动控制精度，也保持了系统结构清晰。")]
       }),
 
       new Paragraph({
@@ -159,7 +159,7 @@ const doc = new Document({
       new Paragraph({
         spacing: { after: 200 },
         indent: { left: 720 },
-        children: [new TextRun("本地OLED屏幕显示速度、力值、位移等实时参数；BLE发送float32格式数据至Phyphox应用（频率10Hz），支持力-时间、速度-时间等曲线绘制。")]
+        children: [new TextRun("本地OLED屏幕显示速度、力值、位移等实时参数；BLE发送float32格式数据至Phyphox应用（频率20Hz），支持力-时间、速度-时间等曲线绘制。")]
       }),
 
       new Paragraph({
@@ -226,7 +226,7 @@ const doc = new Document({
       }),
       new Paragraph({
         spacing: { after: 200 },
-        children: [new TextRun("硬件初始化 → 菜单显示 → 参数设置 → 电机启动 → 实时采集 → BLE发送 → 任务完成。整个流程由FreeRTOS任务调度器管理，各模块独立工作，通过消息队列协调。")]
+        children: [new TextRun("硬件初始化 → 菜单显示 → 参数设置 → 电机启动 → 定时器输出步进脉冲 → HX711实时采集 → OLED显示与BLE发送 → 任务完成。整个流程由主循环与硬件定时器协同完成。")]
       }),
 
       // ========== 第四章：运动模式 ==========
@@ -337,13 +337,13 @@ const doc = new Document({
       }),
       createTable([
         ["性能指标", "规格", "说明"],
-        ["速度范围", "0.5-200 mm/s", "常规教学应用5-30 mm/s"],
+        ["速度范围", "5-200 mm/s", "常规教学应用5-30 mm/s"],
         ["速度精度", "±0.5%", "通过定时器脉冲控制"],
         ["力值范围", "0-5 N", "满足标准学生实验"],
         ["力值精度", "±0.001 N", "HX711 24位 + 卡尔曼滤波"],
-        ["采样频率", "10 Hz (BLE)", "足以捕获运动过程"],
+        ["采样频率", "20 Hz (BLE)", "足以捕获运动过程"],
         ["BLE延迟", "<100 ms", "满足实时显示要求"],
-        ["OLED刷新率", "60 FPS", "流畅的UI动画"],
+        ["OLED刷新率", "约 30 FPS", "流畅显示且减少刷新干扰"],
         ["续航时间", "4-6 小时", "标准18650电池"]
       ]),
 
